@@ -4,10 +4,11 @@
 <head>
     <meta charset="utf-8">
     <script src="https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@main/slidershow/slidershow.js"></script>
+    <link rel="stylesheet" href="style.css" />
 </head>
 
 <body>
-    <main>
+    <main data-start>
         <section>
 {contents}
         </section>
