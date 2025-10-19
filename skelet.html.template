@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8">
-    <script src="https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@main/slidershow/slidershow.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@0.9.6/slidershow/slidershow.js"></script>
     <link rel="stylesheet" href="style.css" />
 </head>
 

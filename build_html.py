@@ -34,13 +34,20 @@ class Env:
     output: Path | None = None
     template = Path("skelet.html.template")
 
+    replace_in_filename: list[tuple[str, str]] | None = None
+    """ If set, filename from the sheet will be replaced according to this.
+    Ex: --replace-filename /mnt/user /mnt/foo jpg JPG -> filename /mnt/user/dir/img.jpg → /mnt/foo/dir/img.JPG
+    """
+
 
 TEMPLATE = """<article data-video-points='[{points}]'><video controls="controls" data-src="{src}"></video></article>"""
+TEMPLATE_IMG = """<article data-step-points='{points}'><img data-src="{src}"/></article>"""
 TEMPLATE_TEXT = """<article class="main">
                     <h1>{title}</h1>
                     <p>{text}</p>
                 </article>"""
-NUM = r"(\d+(?::\d+)?(?:\.\d+)?)"  # a number including decimal and colon
+TNUM = r"(\d*(?::\d+)?\.?\d+?)"  # time number, a number including decimal dot and a colon
+NUM = r"(\d*\.?\d+?)"  # a number including decimal dot, ex '3', '1.3', '.3'
 
 clist = {"mute": "mute", "unmute": "unmute", "M": "mute", "U": "unmute", "pause": "pause"}
 
@@ -74,7 +81,7 @@ def parse_commands(start: str | None, commands: list[str]):
                 for r in ([subcommand] if "[" in subcommand else subcommand.split(","))]
     logger.info(commands)
     for i, command in enumerate(commands):
-        if m := match(rf"{NUM}$", command):
+        if m := match(rf"{TNUM}$", command):
             if moment or tokens:
                 if not tokens:
                     raise ValueError(f"No action at {command} at: {commands}")
@@ -87,9 +94,9 @@ def parse_commands(start: str | None, commands: list[str]):
             if i == len(commands)-1:  # end number, stop at this moment1
                 yield f'[{tim(m[0])}, "pause"]'
             continue
-        elif m := match(rf"→{NUM}$", command):
+        elif m := match(rf"→{TNUM}$", command):
             tokens.append(f"goto:{tim(m[1])}")
-        elif m := match(rf"{NUM}→{NUM}", command):
+        elif m := match(rf"{TNUM}→{TNUM}", command):
             if moment:
                 raise ValueError(f"Moment already defined, moment {moment} while processing {command} at {commands}")
             yield f'[{tim(m[1])}, "goto:{tim(m[2])}"]'
@@ -113,7 +120,7 @@ def parse_commands(start: str | None, commands: list[str]):
         else:
             raise ValueError(f"Unknown command {command} at {commands}")
     if tokens:
-        yield output_tokens(moment, tokens)
+        yield output_tokens(moment or "0", tokens)
 
 
 def cell_value(val):
@@ -126,6 +133,9 @@ def cell_value(val):
 
 if __name__ == "__main__":
     m = run(Env)
+    if not m.env.file.exists():
+        print("File does not exists", m.env.file)
+        quit()
     sheets = ezodf.opendoc(m.env.file).sheets
 
     if m.env.sheet:
@@ -148,8 +158,20 @@ if __name__ == "__main__":
             if not any((comment, filename, start, *commands)):
                 print("EARLY STOP")
                 break
-            if filename:  # video frame
-                out = TEMPLATE.format(points=",".join(parse_commands(start, commands)), src=filename)
+            if filename:  # media frame
+                if Path(filename).suffix.lower() == ".jpg":
+                    template = TEMPLATE_IMG
+                    points = start or ""
+                    if any(c.strip() for c in commands if c):
+                        raise ValueError("commands is being ignored for img")
+                else:
+                    template = TEMPLATE
+                    points = ",".join(parse_commands(start, commands))
+
+                for args in m.env.replace_in_filename:
+                    filename = filename.replace(*args)
+
+                out = template.format(points=points, src=filename)
             elif start or commands:  # text frame
                 out = TEMPLATE_TEXT.format(title=start, text="".join(str(a) for a in commands if a))
             else:
@@ -168,3 +190,4 @@ if __name__ == "__main__":
             if suffix:
                 fname = fname.with_name(f"{fname.stem}_{sheet.name}{fname.suffix}")
             fname.write_text(m.env.template.read_text().format(contents="\n".join(output)))
+            print("Written to", fname)
