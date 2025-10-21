@@ -59,5 +59,8 @@ class Env:
     Ex: --replace-filename /mnt/user /mnt/foo jpg JPG -> filename /mnt/user/dir/img.jpg → /mnt/foo/dir/img.JPG
     """
 
-    filename_exist_check: list[Path] | None = None
+    filename_autosearch: list[Path] | None = None
     """ If the filename is without path and the file does not exist, try finding the file within these dirs. """
+
+    filename_autosearch_cache: bool = True
+    """Use a cache file for filename_autosearch, persistent accress program launches. """
