@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slidershow_builder"
+version = "0.5.0"
+description = "Slideshow builder"
+authors = [{ name = "Edvard Rejthar", email = "slidershow-builder@edvard.cz" }]
+readme = "README.md"
+license = { text = "LGPL-3.0-or-later" }
+requires-python = ">=3.10"
+
+dependencies = ["ezodf", "mininterface", "tqdm"]
+
+[tool.setuptools.package-data]
+"slidershow_builder" = ["templates/*"]
+
+[project.scripts]
+slidershow-builder = "slidershow_builder.__main__:main"

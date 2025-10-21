@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from convert_tools import ffmpeg_video, file_meta_key, heic_to_jpg, is_hevc
+from .convert_tools import ffmpeg_video, file_meta_key, heic_to_jpg, is_hevc
 
 IMAGE_SUFFIXES = ".jpg", ".jpeg", ".jxl", ".png", ".gif", ".avif", ".webp", ".heic"
 
