@@ -23,9 +23,14 @@ class Convert:
     autogenerate: bool = True
     """If .enable, generate all the needy media to the cache. """
 
-    check_mp4_for_hevc: bool = True
-
     cache_dir: Path = Path("/tmp")
+
+    heic: bool = True
+    """Generate JPG from HEIC."""
+    hevc: bool = True
+    """Generate MP4 from HEVC."""
+    hevc_in_mp4: bool = True
+    """ Check for HEVC codec in MP4 video files."""
 
     def __post_init__(self):
         if self.enable and not self.cache_dir.exists():
@@ -52,11 +57,13 @@ class Convert:
             else:
                 match suff:
                     case ".heic":
-                        path = self.get_converted(path, ".jpg", heic_to_jpg)
+                        if self.heic:
+                            path = self.get_converted(path, ".jpg", heic_to_jpg)
                     case ".hevc":
-                        path = self.get_converted(path, ".mp4", ffmpeg_video)
+                        if self.hevc:
+                            path = self.get_converted(path, ".mp4", ffmpeg_video)
                     case ".mp4":
-                        if self.check_mp4_for_hevc and is_hevc(path):
+                        if self.hevc and self.hevc_in_mp4 and is_hevc(path):
                             path = self.get_converted(path, ".mp4", ffmpeg_video)
 
         return path
