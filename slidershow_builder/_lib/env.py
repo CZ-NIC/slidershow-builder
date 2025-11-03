@@ -8,9 +8,12 @@ from pathlib import Path
 @dataclass
 class Slidershow:
     template: Path = Path(__file__).parent.parent / "templates/skelet.html.template"
+    """HTML template the presentation is made of."""
+
     url: str = (
-        "https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@0.9.6/slidershow/slidershow.js"
+        "https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@main/slidershow/slidershow.js"
     )
+    """The URL to be used for generating. Ex. you might want to use an offline local copy of the project."""
 
 
 @dataclass

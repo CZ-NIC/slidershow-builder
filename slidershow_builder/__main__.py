@@ -3,6 +3,7 @@ import logging
 
 import ezodf
 from mininterface import run
+from tyro.conf import DisallowNone, FlagCreatePairsOff
 
 from ._lib.env import Env
 from ._lib.find_file_recursive import filename_cache
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    m = run(Env)
+    m = run(DisallowNone[FlagCreatePairsOff[Env]])
     if not m.env.file.exists():
         print("File does not exists", m.env.file)
         quit()
