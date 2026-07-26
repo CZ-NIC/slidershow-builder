@@ -1,8 +1,12 @@
 from .convert import Convert
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from tyro.conf import Positional
+
+from ..media import Tools
 
 
 @dataclass
@@ -87,3 +91,70 @@ class Env:
 
     read_exif: bool = True
     """ Adds EXIF info to the HTML. The same way as if the file was dragged into a live Slidershow session """
+
+
+@dataclass
+class Build(Env):
+    """Generate a slidershow HTML from a spreadsheet (.ods).
+
+    This is the default subcommand: `slidershow-builder --file x.ods` is equivalent
+    to `slidershow-builder build --file x.ods`.
+    """
+
+
+@dataclass
+class Previews:
+    """Sync a media tree: generate thumbnails + fallback conversions for browser-incompatible
+    files, detect moved files, prune orphans, optionally fix mtime from capture time."""
+
+    source: Positional[Path]
+    """Root directory of the source media tree."""
+
+    preview_dir: Path | None = None
+    """Where to write thumbnails (mirrors the source tree structure). None = skip previews."""
+
+    fallback_dir: Path | None = None
+    """Where to write browser-incompatible fallback conversions (HEIC->JPEG, HEVC->H.264).
+    None = skip fallbacks."""
+
+    size: int = 320
+    """Thumbnail long-edge size in px."""
+
+    quality: int = 75
+    """Thumbnail WebP quality."""
+
+    fix_mtime: bool = True
+    """Set file mtime from EXIF/ffprobe capture time."""
+
+    detect_moves: bool = True
+    """Detect renamed/moved files by basename instead of regenerating."""
+
+    prune_orphans: bool = True
+    """Delete previews/fallbacks whose source no longer exists."""
+
+    json: bool = False
+    """Print the sync report as JSON instead of a text summary."""
+
+    tools: Tools = field(default_factory=Tools)
+    """Configurable paths to the ffmpeg/ffprobe binaries."""
+
+
+@dataclass
+class FixMtime:
+    """Backfill file mtime from EXIF/ffprobe capture time (`--backfill-mtime` of old)."""
+
+    source: Positional[Path]
+    """Directory to walk and backfill mtime on."""
+
+    tools: Tools = field(default_factory=Tools)
+    """Configurable paths to the ffmpeg/ffprobe binaries."""
+
+
+@dataclass
+class Probe:
+    """Debug: print codec, browser-compatibility, capture time for a single file."""
+
+    file: Positional[Path]
+
+    tools: Tools = field(default_factory=Tools)
+    """Configurable paths to the ffmpeg/ffprobe binaries."""

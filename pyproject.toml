@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slidershow_builder"
-version = "0.5.0"
+version = "0.6.0"
 description = "Slideshow builder"
 authors = [{ name = "Edvard Rejthar", email = "slidershow-builder@edvard.cz" }]
 readme = "README.md"
 license = { text = "LGPL-3.0-or-later" }
 requires-python = ">=3.10"
 
-dependencies = ["ezodf", "mininterface[basic]", "tqdm", "jinja2", "piexif"]
+dependencies = ["ezodf", "mininterface[basic]", "tqdm", "jinja2", "piexif", "pillow", "pillow-heif"]
 
 [tool.setuptools.package-data]
 "slidershow_builder" = ["templates/*"]
