@@ -4,11 +4,12 @@ and the tree-sync path (`slidershow-builder previews`).
 See PLAN.md for the rationale behind this module.
 """
 
+import json
 import logging
 import os
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -40,7 +41,13 @@ PHOTO_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".gif", ".avif", ".webp",
     ".heic", ".heif", ".bmp", ".tiff", ".tif", ".jp2", ".psd",
 }
-VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".3gp", ".hevc", ".m4v", ".webm"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".3gp", ".hevc", ".m4v", ".webm",
+                  ".mpg", ".mpeg"}
+
+#: Photo formats no mainstream browser decodes — the only ones that get a JPEG fallback.
+#: (`.tif`/`.psd`/`.jp2` are unplayable too, but they do not appear in practice and
+#: converting them wholesale would be a surprise; add them here if that ever changes.)
+INCOMPATIBLE_PHOTO_SUFFIXES = {".heic", ".heif"}
 
 COMPATIBLE_VCODECS = {"h264", "vp9", "vp8", "av1"}
 COMPATIBLE_ACODECS = {"aac", "mp3", "opus", "vorbis"}
@@ -67,7 +74,8 @@ class MediaInfo:
     browser_compatible: bool = False
 
 
-def _kind_of(path: Path) -> Literal["photo", "video", "other"]:
+def kind_of(path: Path) -> Literal["photo", "video", "other"]:
+    """Media kind by file extension only — no I/O, cheap enough for a whole-tree walk."""
     suffix = path.suffix.lower()
     if suffix in VIDEO_SUFFIXES:
         return "video"
@@ -76,29 +84,30 @@ def _kind_of(path: Path) -> Literal["photo", "video", "other"]:
     return "other"
 
 
+_kind_of = kind_of  # backwards-compatible alias
+
+
 def _ffprobe_streams(path: Path, tools: Tools) -> tuple[Optional[str], Optional[str]]:
+    # JSON, not the flat format: ffprobe emits the requested fields in its own order
+    # (`codec_name` before `codec_type`), so line-wise parsing cannot pair them up.
     try:
         result = subprocess.run(
             [
                 str(tools.ffprobe), "-v", "error",
                 "-show_entries", "stream=codec_type,codec_name",
-                "-of", "default=noprint_wrappers=1", str(path),
+                "-of", "json", str(path),
             ],
             capture_output=True, text=True, check=True,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        streams = json.loads(result.stdout).get("streams", [])
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         return None, None
     vcodec = acodec = None
-    codec_type = None
-    for line in result.stdout.splitlines():
-        if line.startswith("codec_type="):
-            codec_type = line.split("=", 1)[1].strip()
-        elif line.startswith("codec_name="):
-            name = line.split("=", 1)[1].strip()
-            if codec_type == "video" and vcodec is None:
-                vcodec = name
-            elif codec_type == "audio" and acodec is None:
-                acodec = name
+    for stream in streams:
+        if stream.get("codec_type") == "video" and vcodec is None:
+            vcodec = stream.get("codec_name")
+        elif stream.get("codec_type") == "audio" and acodec is None:
+            acodec = stream.get("codec_name")
     return vcodec, acodec
 
 
@@ -117,12 +126,19 @@ def _ffprobe_creation_time(path: Path, tools: Tools) -> Optional[datetime]:
     raw = result.stdout.strip()
     if not raw:
         return None
+    # Container timestamps are UTC ("2026-07-20T09:29:50.000000Z"); EXIF ones (below) are
+    # local and naive. Everything this module returns is naive local time, so convert.
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
         try:
-            return datetime.strptime(raw, fmt)
+            utc = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    return None
+        return utc.astimezone().replace(tzinfo=None)
+    try:  # no trailing Z: an offset may or may not be present
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
 def _photo_capture_time(path: Path) -> Optional[datetime]:
@@ -142,7 +158,7 @@ def _photo_capture_time(path: Path) -> Optional[datetime]:
 
 
 def capture_time(path: Path, *, tools: Tools = DEFAULT_TOOLS) -> Optional[datetime]:
-    kind = _kind_of(path)
+    kind = kind_of(path)
     if kind == "video":
         return _ffprobe_creation_time(path, tools)
     if kind == "photo":
@@ -150,25 +166,32 @@ def capture_time(path: Path, *, tools: Tools = DEFAULT_TOOLS) -> Optional[dateti
     return None
 
 
+def is_compatible_video(path: Path, *, tools: Tools = DEFAULT_TOOLS) -> bool:
+    """Does every mainstream browser play this natively? Costs one ffprobe call."""
+    vcodec, acodec = _ffprobe_streams(path, tools)
+    return vcodec in COMPATIBLE_VCODECS and (acodec is None or acodec in COMPATIBLE_ACODECS)
+
+
 def probe(path: Path, *, tools: Tools = DEFAULT_TOOLS) -> MediaInfo:
-    kind = _kind_of(path)
+    kind = kind_of(path)
     if kind == "video":
         vcodec, acodec = _ffprobe_streams(path, tools)
         compatible = vcodec in COMPATIBLE_VCODECS and (acodec is None or acodec in COMPATIBLE_ACODECS)
         return MediaInfo(path, "video", vcodec, acodec, _ffprobe_creation_time(path, tools), compatible)
     if kind == "photo":
-        return MediaInfo(path, "photo", None, None, _photo_capture_time(path), True)
+        compatible = path.suffix.lower() not in INCOMPATIBLE_PHOTO_SUFFIXES
+        return MediaInfo(path, "photo", None, None, _photo_capture_time(path), compatible)
     return MediaInfo(path, "other", None, None, None, True)
 
 
 def thumbnail(src: Path, dst: Path, *, size: int = 320, quality: int = 75, tools: Tools = DEFAULT_TOOLS) -> bool:
     """Write a WebP thumbnail (long edge `size` px) for a photo or video frame."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    kind = _kind_of(src)
+    kind = kind_of(src)
     if kind == "photo":
         return _photo_thumbnail(src, dst, size, quality)
     if kind == "video":
-        return _video_thumbnail(src, dst, size, tools)
+        return _video_thumbnail(src, dst, size, quality, tools)
     return False
 
 
@@ -176,9 +199,12 @@ def _photo_thumbnail(src: Path, dst: Path, size: int, quality: int) -> bool:
     _require_pillow()
     try:
         with Image.open(src) as im:
-            im.seek(0)  # first frame of animated GIF / multi-frame HEIC
+            # No seek() needed: an open animated GIF sits on frame 0, a multi-frame HEIC on
+            # its primary image, and a PSD on its flattened composite (whose "frames" are
+            # layers numbered from 1, so seek(0) would raise there).
             im = ImageOps.exif_transpose(im)
-            im.thumbnail((size, size))
+            im.thumbnail((size, size), Image.Resampling.LANCZOS)
+            # no exif=/icc_profile= passed → metadata is stripped, as ImageMagick's stripImage() did
             im.convert("RGB").save(dst, "WEBP", quality=quality)
         return True
     except Exception as e:
@@ -186,19 +212,26 @@ def _photo_thumbnail(src: Path, dst: Path, size: int, quality: int) -> bool:
         return False
 
 
-def _video_thumbnail(src: Path, dst: Path, size: int, tools: Tools) -> bool:
-    scale = f"scale='min({size},iw)':'min({size},ih)':force_original_aspect_ratio=decrease"
-    for seek in ("1", "0"):  # videos shorter than 1s fall back to the very first frame
+def _video_thumbnail(src: Path, dst: Path, size: int, quality: int, tools: Tools) -> bool:
+    scale = (f"scale=w={size}:h={size}:force_original_aspect_ratio=decrease"
+             ":force_divisible_by=2")
+    for seek in ("1", "0"):  # videos shorter than 1s have no frame at -ss 1
         cmd = [
-            str(tools.ffmpeg), "-y", "-ss", seek, "-i", str(src),
-            "-frames:v", "1", "-vf", scale, str(dst),
+            str(tools.ffmpeg), "-hide_banner", "-loglevel", "error",
+            "-ss", seek, "-i", str(src),
+            "-frames:v", "1", "-vf", scale, "-quality", str(quality),
+            "-y", str(dst),
         ]
         try:
             subprocess.run(cmd, capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning("thumbnail (-ss %s) failed for %s: %s", seek, src,
+                           getattr(e, "stderr", b"")[-500:] or e)
+            dst.unlink(missing_ok=True)
             continue
         if dst.exists() and dst.stat().st_size > 0:
             return True
+        dst.unlink(missing_ok=True)
     return False
 
 
@@ -220,9 +253,9 @@ def to_h264(src: Path, dst: Path, *, crf: int = 20, preset: str = "veryfast", to
     """Transcode to a browser-compatible H.264/AAC mp4 with +faststart."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        str(tools.ffmpeg), "-y", "-i", str(src),
-        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
-        "-c:a", "aac", "-movflags", "+faststart", str(dst),
+        str(tools.ffmpeg), "-hide_banner", "-loglevel", "error", "-i", str(src),
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-movflags", "+faststart", "-y", str(dst),
     ]
     try:
         subprocess.run(cmd, capture_output=True, check=True)

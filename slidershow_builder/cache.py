@@ -35,11 +35,16 @@ class ContentHashLayout:
 
 @dataclass
 class MirrorLayout:
-    """`cache_dir/<rel-to-source_root>.<suffix>` — mirrors the source tree structure."""
+    """`cache_dir/<rel-to-source_root><suffix>` — mirrors the source tree structure.
+
+    The suffix is *appended*, not substituted: `a/b.heic` -> `cache/a/b.heic.webp`.
+    That keeps the original extension visible, lets a template derive the cache path
+    from the source name alone, and stops `b.jpg` and `b.png` from colliding.
+    """
 
     cache_dir: Path
     source_root: Path
 
     def path_for(self, path: Path, suffix: str) -> Path:
         rel = path.relative_to(self.source_root) if path.is_absolute() else path
-        return (self.cache_dir / rel).with_suffix(suffix)
+        return self.cache_dir / rel.parent / (rel.name + suffix)

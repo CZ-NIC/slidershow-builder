@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slidershow_builder"
-version = "0.6.1"
+version = "0.6.2"
 description = "Slideshow builder"
 authors = [{ name = "Edvard Rejthar", email = "slidershow-builder@edvard.cz" }]
 readme = "README.md"

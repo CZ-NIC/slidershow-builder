@@ -1,15 +1,51 @@
-"""Tree sync — the core of upload.edvard.cz's previews.php, ported. See PLAN.md."""
+"""Tree sync — the core of upload.edvard.cz's previews.php, ported. See PLAN.md.
 
+Mirrors a source media tree into a preview cache (and, for formats browsers cannot
+decode, a fallback cache). Designed to be run from cron every minute over thousands
+of files, so the steady state must be cheap: a file that already has its preview
+costs one `stat`, nothing else. In particular no file is ever decoded or probed
+just to find out that there is nothing to do.
+
+Conventions shared with the PHP implementation it replaces (a switch-over must not
+invalidate the existing cache, and either implementation cleans up after the other):
+
+* `cache/<rel><suffix>` — suffix appended, see `MirrorLayout`
+* `<dst>.part.<ext>`    — half-written output; renamed onto `<dst>` only once complete
+* `<dst>.fail`          — conversion failed; do not retry until the source changes
+* `<fallback_dir>/.compatible-videos.json` — "this video needs no fallback" verdicts,
+  keyed by source mtime, so ffprobe does not run on every video every minute
+"""
+
+import json
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from .cache import MirrorLayout
-from .media import DEFAULT_TOOLS, Tools, fix_mtime as _fix_mtime, probe, thumbnail, to_h264, to_jpeg
+from .media import (
+    DEFAULT_TOOLS,
+    INCOMPATIBLE_PHOTO_SUFFIXES,
+    Tools,
+    fix_mtime as _fix_mtime,
+    is_compatible_video,
+    kind_of,
+    thumbnail,
+    to_h264,
+    to_jpeg,
+)
 
 logger = logging.getLogger(__name__)
+
+STALE_PART_AGE = 3600
+"""A `.part` file older than this is a leftover of a crashed/killed run, not work in progress."""
+
+COMPAT_CACHE_NAME = ".compatible-videos.json"
+
+_FALLBACK_ORIGINAL_RE = re.compile(r"\.(jpg|mp4)(\.fail|\.part\.\w+)?$")
 
 
 @dataclass
@@ -28,6 +64,9 @@ class FallbackTarget:
 
 @dataclass
 class SyncReport:
+    """What the run changed. `created`/`failed`/`mtime_fixed` name **source** files,
+    `moved`/`removed` name **cache** files (their source is gone or elsewhere)."""
+
     created: dict[str, list[Path]] = field(default_factory=lambda: {"preview": [], "fallback": []})
     moved: list[tuple[Path, Path]] = field(default_factory=list)
     removed: list[Path] = field(default_factory=list)
@@ -50,26 +89,223 @@ class SyncReport:
         }
 
 
-def _prune_empty_dirs(root: Path) -> None:
-    if not root.exists():
+def _walk(base: Path) -> Iterator[Path]:
+    """Regular files under `base`. Dotfiles are skipped (hidden *directories* are entered,
+    matching the PHP implementation)."""
+    if not base.is_dir():
         return
-    dirs = sorted((d for d in root.rglob("*") if d.is_dir()), key=lambda p: len(p.parts), reverse=True)
-    for d in dirs:
+    for path in base.rglob("*"):
+        if path.is_file() and not path.name.startswith("."):
+            yield path
+
+
+def _stale(path: Path) -> bool:
+    return time.time() - path.stat().st_mtime > STALE_PART_AGE
+
+
+def _fail_path(dst: Path) -> Path:
+    return dst.with_name(dst.name + ".fail")
+
+
+def _part_path(dst: Path) -> Path:
+    # `<dst>.part.<ext>`: ffmpeg/Pillow infer the output format from the extension,
+    # so the temporary name has to keep it.
+    return dst.with_name(dst.name + ".part" + dst.suffix)
+
+
+def _remove_with_empty_dirs(file: Path, base: Path) -> None:
+    file.unlink(missing_ok=True)
+    parent = file.parent
+    while parent != base and base in parent.parents:
         try:
-            d.rmdir()
+            parent.rmdir()
         except OSError:
-            pass  # not empty
+            break  # not empty
+        parent = parent.parent
 
 
-def _find_moved(dst: Path, layout_dir: Path, claimed: set) -> Optional[Path]:
-    """A source file was renamed/moved: look for a cache entry with the same basename
-    elsewhere under the cache dir that no other file has claimed yet."""
-    if not layout_dir.exists():
+def _generate(src: Path, dst: Path, make: Callable[[Path, Path], bool]) -> Optional[bool]:
+    """Run `make` into a `.part` file and atomically rename it onto `dst`, so the web
+    never serves a half-written file.
+
+    Returns True when created, False when the conversion failed now (a `.fail` marker
+    is left behind), None when a previous failure is still current — the caller reports
+    only genuine, new failures.
+    """
+    fail = _fail_path(dst)
+    if fail.is_file() and fail.stat().st_mtime >= src.stat().st_mtime:
         return None
-    for candidate in layout_dir.rglob(dst.name):
-        if candidate.is_file() and candidate != dst and candidate not in claimed:
-            return candidate
-    return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    part = _part_path(dst)
+    try:
+        ok = make(src, part) and part.is_file() and part.stat().st_size > 0
+    except Exception as e:  # a broken source must never kill the whole cron run
+        logger.warning("conversion of %s crashed: %s", src, e)
+        ok = False
+    if ok:
+        part.replace(dst)
+        fail.unlink(missing_ok=True)
+        return True
+    part.unlink(missing_ok=True)
+    fail.touch()
+    return False
+
+
+def _sync_previews(
+    originals: dict[str, Path],
+    target: PreviewTarget,
+    layout: MirrorLayout,
+    report: SyncReport,
+    log: Callable[[str], None],
+    *,
+    detect_moves: bool,
+    prune_orphans: bool,
+    fix_mtime: bool,
+    tools: Tools,
+) -> None:
+    root = layout.cache_dir
+    existing: dict[str, Path] = {}  # source rel path -> its preview
+
+    for path in _walk(root):
+        rel = str(path.relative_to(root))
+        if rel.endswith(".part.webp"):
+            if _stale(path):
+                path.unlink(missing_ok=True)
+        elif rel.endswith(".webp.fail"):
+            if rel[: -len(".webp.fail")] not in originals:
+                _remove_with_empty_dirs(path, root)
+        elif rel.endswith(".webp"):
+            existing[rel[: -len(".webp")]] = path
+
+    missing = [rel for rel in originals if rel not in existing]
+    orphans = {rel: path for rel, path in existing.items() if rel not in originals}
+
+    # A moved/renamed source shows up as one orphaned preview plus one missing preview
+    # with the same basename — move the preview instead of re-encoding it. Pure
+    # optimization: on any ambiguity we fall through to delete + regenerate.
+    if detect_moves and orphans and missing:
+        by_basename: dict[str, list[str]] = {}
+        for rel in missing:
+            by_basename.setdefault(Path(rel).name, []).append(rel)
+        for rel, preview in list(orphans.items()):
+            candidates = by_basename.get(Path(rel).name, [])
+            if len(candidates) != 1:
+                continue
+            dst = layout.path_for(Path(candidates[0]), ".webp")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            preview.rename(dst)
+            report.moved.append((preview, dst))
+            log(f"→ {rel} => {candidates[0]}")
+            del orphans[rel]
+            del by_basename[Path(rel).name]
+            missing.remove(candidates[0])
+
+    if prune_orphans:
+        for rel, preview in orphans.items():
+            _remove_with_empty_dirs(preview, root)
+            report.removed.append(preview)
+            log(f"- {rel}")
+
+    for rel in missing:
+        src = originals[rel]
+        dst = layout.path_for(Path(rel), ".webp")
+        created = _generate(
+            src, dst,
+            lambda s, d: thumbnail(s, d, size=target.size, quality=target.quality, tools=tools),
+        )
+        if created:
+            report.created["preview"].append(src)
+            log(f"+ {dst}")
+            # Only newly previewed files are touched: an already-cached file was handled
+            # in some earlier run, and re-reading EXIF of the whole tree every minute
+            # would defeat the point. Use the `fix-mtime` subcommand for a full pass.
+            if fix_mtime:
+                fixed = _fix_mtime(src, tools=tools)
+                if fixed is not None:
+                    report.mtime_fixed.append((src, fixed))
+                    log(f"⌚ {src} ← {fixed:%Y-%m-%d %H:%M:%S}")
+        elif created is False:
+            report.failed.append((src, "preview generation failed"))
+            log(f"✗ {src}")
+
+
+def _sync_fallbacks(
+    originals: dict[str, Path],
+    target: FallbackTarget,
+    layout: MirrorLayout,
+    report: SyncReport,
+    log: Callable[[str], None],
+    *,
+    prune_orphans: bool,
+    tools: Tools,
+) -> None:
+    root = layout.cache_dir
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Unlike previews there is no move detection here: a moved original just orphans its
+    # fallback and gets a fresh one. Only a minority of files need a fallback at all.
+    for path in _walk(root):
+        rel = str(path.relative_to(root))
+        original = _FALLBACK_ORIGINAL_RE.sub("", rel)
+        if original not in originals:
+            if prune_orphans:
+                _remove_with_empty_dirs(path, root)
+                report.removed.append(path)
+                log(f"- {rel}")
+        elif ".part." in path.name and _stale(path):
+            path.unlink(missing_ok=True)
+
+    # "Video X was compatible when its mtime was T" — one shared JSON file rather than a
+    # sentinel per video, so a folder of thousands of ordinary mp4s neither litters the
+    # disk nor costs thousands of ffprobe calls a minute.
+    compat_file = root / COMPAT_CACHE_NAME
+    compat: dict[str, int] = {}
+    if compat_file.is_file():
+        try:
+            loaded = json.loads(compat_file.read_text())
+            if isinstance(loaded, dict):
+                compat = {k: v for k, v in loaded.items() if k in originals}
+        except (OSError, ValueError):
+            pass
+    before = dict(compat)
+
+    for rel, src in originals.items():
+        photo = kind_of(src) == "photo"
+        dst = layout.path_for(Path(rel), ".jpg" if photo else ".mp4")
+        if dst.is_file():
+            continue
+        fail = _fail_path(dst)
+        try:
+            src_mtime = int(src.stat().st_mtime)
+            if fail.is_file() and fail.stat().st_mtime >= src_mtime:
+                continue  # failed before, source unchanged — do not retry every minute
+        except OSError:
+            continue
+        if photo:
+            needed = src.suffix.lower() in INCOMPATIBLE_PHOTO_SUFFIXES
+        else:
+            if compat.get(rel) == src_mtime:
+                continue  # probed before, compatible, source unchanged since
+            needed = not is_compatible_video(src, tools=tools)
+            if not needed:
+                compat[rel] = src_mtime
+        if not needed:
+            continue
+        compat.pop(rel, None)
+        created = _generate(
+            src, dst,
+            (lambda s, d: to_jpeg(s, d, quality=target.jpeg_quality)) if photo
+            else (lambda s, d: to_h264(s, d, crf=target.crf, tools=tools)),
+        )
+        if created:
+            report.created["fallback"].append(src)
+            log(f"+ fallback {dst}")
+        elif created is False:
+            report.failed.append((src, "fallback generation failed"))
+            log(f"✗ fallback {src}")
+
+    if compat != before:
+        compat_file.write_text(json.dumps(compat))
 
 
 def sync_tree(
@@ -84,74 +320,23 @@ def sync_tree(
     on_event: Optional[Callable[[str], None]] = None,
 ) -> SyncReport:
     report = SyncReport()
-    log = on_event or (lambda msg: logger.info(msg))
+    log = on_event or logger.info
 
-    preview_layout = MirrorLayout(previews.dir, source) if previews else None
-    fallback_layout = MirrorLayout(fallbacks.dir, source) if fallbacks else None
-    output_dirs = [d.dir.resolve() for d in (previews, fallbacks) if d is not None]
+    source = source.resolve()
+    output_dirs = [t.dir.resolve() for t in (previews, fallbacks) if t is not None]
 
-    seen_previews: set[Path] = set()
-    seen_fallbacks: set[Path] = set()
+    originals: dict[str, Path] = {}  # rel path -> absolute path, media files only
+    for path in _walk(source):
+        resolved = path.resolve()
+        if any(d == resolved or d in resolved.parents for d in output_dirs):
+            continue  # cache dir nested inside the source tree: never sync our own output
+        if kind_of(path) != "other":
+            originals[str(path.relative_to(source))] = path
 
-    for path in source.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(d == path.resolve() or d in path.resolve().parents for d in output_dirs):
-            continue  # preview/fallback dir nested inside source: never sync our own output
-        info = probe(path, tools=tools)
-        if info.kind == "other":
-            continue
-
-        if fix_mtime:
-            fixed = _fix_mtime(path, tools=tools)
-            if fixed is not None:
-                report.mtime_fixed.append((path, fixed))
-                log(f"mtime fixed: {path} -> {fixed}")
-
-        if preview_layout is not None:
-            dst = preview_layout.path_for(path, ".webp")
-            seen_previews.add(dst)
-            if not dst.exists():
-                moved_from = _find_moved(dst, preview_layout.cache_dir, seen_previews) if detect_moves else None
-                if moved_from is not None:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    moved_from.rename(dst)
-                    report.moved.append((moved_from, dst))
-                    log(f"preview moved: {moved_from} -> {dst}")
-                elif thumbnail(path, dst, size=previews.size, quality=previews.quality, tools=tools):
-                    report.created["preview"].append(dst)
-                    log(f"preview created: {dst}")
-                else:
-                    report.failed.append((path, "preview generation failed"))
-
-        if fallback_layout is not None and not info.browser_compatible:
-            suffix = ".jpg" if info.kind == "photo" else ".mp4"
-            dst = fallback_layout.path_for(path, suffix)
-            seen_fallbacks.add(dst)
-            if not dst.exists():
-                ok = (
-                    to_jpeg(path, dst, quality=fallbacks.jpeg_quality)
-                    if info.kind == "photo"
-                    else to_h264(path, dst, crf=fallbacks.crf, tools=tools)
-                )
-                if ok:
-                    report.created["fallback"].append(dst)
-                    log(f"fallback created: {dst}")
-                else:
-                    report.failed.append((path, "fallback generation failed"))
-
-    if prune_orphans:
-        for layout, seen, kind in (
-            (preview_layout, seen_previews, "preview"),
-            (fallback_layout, seen_fallbacks, "fallback"),
-        ):
-            if layout is None or not layout.cache_dir.exists():
-                continue
-            for existing in layout.cache_dir.rglob("*"):
-                if existing.is_file() and existing not in seen:
-                    existing.unlink()
-                    report.removed.append(existing)
-                    log(f"{kind} orphan removed: {existing}")
-            _prune_empty_dirs(layout.cache_dir)
-
+    if previews is not None:
+        _sync_previews(originals, previews, MirrorLayout(previews.dir, source), report, log, detect_moves=detect_moves,
+                       prune_orphans=prune_orphans, fix_mtime=fix_mtime, tools=tools)
+    if fallbacks is not None:
+        _sync_fallbacks(originals, fallbacks, MirrorLayout(fallbacks.dir, source), report, log,
+                        prune_orphans=prune_orphans, tools=tools)
     return report
