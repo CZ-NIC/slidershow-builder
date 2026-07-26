@@ -1,7 +1,13 @@
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-import piexif
+
+from .optional_deps import MissingOptionalDependency
+
+try:
+    import piexif
+except ImportError:
+    piexif = None
 
 
 def dms_to_dd(dms, ref: str) -> float:
@@ -15,6 +21,8 @@ def dms_to_dd(dms, ref: str) -> float:
 
 
 def read_exif(path: Path) -> tuple[Optional[str], Optional[tuple[float, float]], Optional[datetime]]:
+    if piexif is None:
+        raise MissingOptionalDependency("Reading EXIF", "build")
     exif_data = piexif.load(str(path))
 
     # model

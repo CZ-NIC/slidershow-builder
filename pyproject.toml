@@ -4,14 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slidershow_builder"
-version = "0.6.0"
+version = "0.6.1"
 description = "Slideshow builder"
 authors = [{ name = "Edvard Rejthar", email = "slidershow-builder@edvard.cz" }]
 readme = "README.md"
 license = { text = "LGPL-3.0-or-later" }
 requires-python = ">=3.10"
 
-dependencies = ["ezodf", "mininterface[basic]", "tqdm", "jinja2", "piexif", "pillow", "pillow-heif"]
+dependencies = ["mininterface[basic]"]
+
+[project.optional-dependencies]
+# needed for the `build` subcommand (spreadsheet -> HTML)
+build = ["ezodf", "lxml", "tqdm", "jinja2", "piexif"]
+# needed for `previews`/`fix-mtime`/`probe`, and for HEIC/HEVC auto-conversion during `build`
+media = ["pillow", "pillow-heif"]
+all = ["slidershow_builder[build,media]"]
 
 [tool.setuptools.package-data]
 "slidershow_builder" = ["templates/*"]

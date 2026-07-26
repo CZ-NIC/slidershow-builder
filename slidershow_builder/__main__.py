@@ -3,13 +3,12 @@ import json
 import logging
 import sys
 
-import ezodf
 from mininterface import run
 from tyro.conf import DisallowNone, FlagCreatePairsOff
 
 from ._lib.env import Build, FixMtime, Previews, Probe
 from ._lib.find_file_recursive import filename_cache
-from ._lib.process import process_sheet
+from ._lib.optional_deps import MissingOptionalDependency
 from .media import fix_mtime as _fix_mtime, probe as _probe
 from .sync import FallbackTarget, PreviewTarget, sync_tree
 
@@ -28,6 +27,13 @@ def _argv_with_implicit_build(argv: list[str]) -> list[str]:
 
 
 def _run_build(env: Build):
+    try:
+        import ezodf
+
+        from ._lib.process import process_sheet
+    except ImportError as e:
+        raise MissingOptionalDependency("Building a slidershow from a spreadsheet", "build") from e
+
     if not env.file.exists():
         print("File does not exists", env.file)
         quit()
@@ -103,15 +109,19 @@ def main():
         args=_argv_with_implicit_build(sys.argv[1:]),
     )
 
-    match m.env:
-        case Build():
-            _run_build(m.env)
-        case Previews():
-            _run_previews(m.env)
-        case FixMtime():
-            _run_fix_mtime(m.env)
-        case Probe():
-            _run_probe(m.env)
+    try:
+        match m.env:
+            case Build():
+                _run_build(m.env)
+            case Previews():
+                _run_previews(m.env)
+            case FixMtime():
+                _run_fix_mtime(m.env)
+            case Probe():
+                _run_probe(m.env)
+    except MissingOptionalDependency as e:
+        print(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

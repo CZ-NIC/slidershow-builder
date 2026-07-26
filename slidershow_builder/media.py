@@ -12,18 +12,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from PIL import Image, ImageFile, ImageOps
+from ._lib.optional_deps import MissingOptionalDependency
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    from PIL import Image, ImageFile, ImageOps
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    _PILLOW_AVAILABLE = True
+except ImportError:
+    _PILLOW_AVAILABLE = False
 
 try:
     import pillow_heif
 
     pillow_heif.register_heif_opener()
-except ImportError:  # pragma: no cover - optional at runtime, required for HEIC
+except ImportError:  # HEIC just won't open; only matters if a .heic file is touched
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pillow():
+    if not _PILLOW_AVAILABLE:
+        raise MissingOptionalDependency("Photo/video processing", "media")
 
 PHOTO_SUFFIXES = {
     ".jpg", ".jpeg", ".png", ".gif", ".avif", ".webp",
@@ -115,6 +126,7 @@ def _ffprobe_creation_time(path: Path, tools: Tools) -> Optional[datetime]:
 
 
 def _photo_capture_time(path: Path) -> Optional[datetime]:
+    _require_pillow()
     try:
         with Image.open(path) as im:
             exif = im.getexif()
@@ -161,6 +173,7 @@ def thumbnail(src: Path, dst: Path, *, size: int = 320, quality: int = 75, tools
 
 
 def _photo_thumbnail(src: Path, dst: Path, size: int, quality: int) -> bool:
+    _require_pillow()
     try:
         with Image.open(src) as im:
             im.seek(0)  # first frame of animated GIF / multi-frame HEIC
@@ -191,6 +204,7 @@ def _video_thumbnail(src: Path, dst: Path, size: int, tools: Tools) -> bool:
 
 def to_jpeg(src: Path, dst: Path, *, quality: int = 92) -> bool:
     """HEIC/HEIF -> full-size JPEG, orientation preserved."""
+    _require_pillow()
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(src) as im:
