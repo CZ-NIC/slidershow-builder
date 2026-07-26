@@ -11,7 +11,7 @@ class Slidershow:
     """HTML template the presentation is made of."""
 
     url: str = (
-        "https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@main/slidershow/slidershow.js"
+        "https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@latest/slidershow/slidershow.js"
     )
     """The URL to be used for generating. Ex. you might want to use an offline local copy of the project."""
 
@@ -84,3 +84,6 @@ class Env:
 
     filename_autosearch_cache: bool = True
     """Use a cache file for filename_autosearch, persistent accress program launches. """
+
+    read_exif: bool = True
+    """ Adds EXIF info to the HTML. The same way as if the file was dragged into a live Slidershow session """

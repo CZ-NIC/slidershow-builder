@@ -2,17 +2,25 @@
 import logging
 from pathlib import Path
 from re import match
+from jinja2 import Template
 
 from tqdm import tqdm
+
+from .exif import read_exif
 
 from .find_file_recursive import find_file_recursive
 from .convert import IMAGE_SUFFIXES
 
 logger = logging.getLogger(__name__)
 
-TEMPLATE = """<article data-video-points='[{points}]'><video controls="controls" data-src="{src}"></video></article>"""
-TEMPLATE_IMG = (
-    """<article data-step-points='{points}'><img data-src="{src}"/></article>"""
+# TODO we should put exif to the <article> - add to the changelog
+# TODO we accept csv, or a mere dir that we crawl
+
+TEMPLATE_VIDEO = Template(
+    """<article{% if points %} data-video-points='[{{ points }}]'{% endif %}><video controls="controls" data-src="{{ src }}"></video></article>"""
+)
+TEMPLATE_IMG = Template(
+    """<article{% if points %} data-step-points='{{ points }}'{% endif %}><img data-src="{{ src }}" {% if datetime %} data-datetime="{{ datetime }}"{% endif %}{% if device %} data-device="{{ device }}"{% endif %}{% if gps %} data-gps="{{ gps[0] }}, {{ gps[1] }}"{% endif %}/></article>"""
 )
 TEMPLATE_TEXT = """<article class="main">
                     <h1>{title}</h1>
@@ -147,7 +155,10 @@ def process_sheet(m, suffix, sheet):
             path = Path(filename)
             pbar.set_postfix_str(path.name)
             suff = path.suffix.lower()
+            device, gps, dt = None, None, None
             if suff in IMAGE_SUFFIXES:
+                device, gps, dt = read_exif(path) # TODO UPRAV SABLONU
+
                 template = TEMPLATE_IMG
                 points = start or ""
                 if any(c.strip() for c in commands if c):
@@ -155,7 +166,7 @@ def process_sheet(m, suffix, sheet):
                             f"commands are being ignored for img '{filename}' {commands}"
                         )
             else:
-                template = TEMPLATE
+                template = TEMPLATE_VIDEO
                 try:
                     points = ",".join(parse_commands(start, commands))
                 except ValueError as e:
@@ -182,7 +193,13 @@ def process_sheet(m, suffix, sheet):
                 # convert to cache
             filename_used = m.env.convert.run(path)
 
-            out = template.format(points=points, src=filename_used)
+            out = template.render(
+                points=points,
+                src=filename_used,
+                datetime=dt.isoformat() if dt else None,
+                device=device,
+                gps=gps,
+            )
         elif start or commands:  # text frame
             out = TEMPLATE_TEXT.format(
                     title=start, text="".join(str(a) for a in commands if a)
