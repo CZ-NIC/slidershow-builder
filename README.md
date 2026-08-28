@@ -18,6 +18,19 @@ Ex. You just use the file name from Google Photos, slidershow-builder will find 
 
 Some formats cannot be played in the browser; slidershow-builder will automatically creates a cache folder with the mp4 files, playable everywhere.
 
+* gather the originals first
+
+Photos are usually scattered over several disks and Google Photos only ever gives you a
+file *name*. `collect` turns a list of people and/or days into one folder of symlinks —
+no data duplicated, nothing written into the originals — with HEIC and unplayable video
+converted on the way in, so the folder is displayable as it stands.
+
+```bash
+slidershow-builder people --takeout-dir /tmp          # who is on which photo
+slidershow-builder collect ./trip --search-dirs ~/Photos /mnt/backup \
+    --names "Jan Novák" --whole-day --date-ranges 2026-08-05:2026-08-07
+```
+
 # Installation
 
 ```bash
@@ -27,7 +40,7 @@ pip install slidershow-builder
 
 Format of the sheet
 
-## Columns:
+## Columns
 
 `comment   filename	start	commands`
 
@@ -73,64 +86,105 @@ comment: SECTION
 
 If the row starts with the word "SECTION", a new `<section>` is inserted. (And the row is skipped.)
 
-## Rows:
+## Rows
 
 Parsing ends on the first empty row.
 
-# Usage
+# People index
+
+Which people are on which photo — the thing `collect --names` selects by. Kept in
+`~/.local/share/slidershow_builder/people.csv` (`--index` for another path).
+
+## Columns
+
+`name,filename,taken`
+
+| column | | |
+|---|---|---|
+| `name` | person's name | Exactly as `--names` will spell it. Free text; `slidershow-builder people` lists what the index holds. |
+| `filename` | base name of the original | No path — the whole point is that Google Photos does not tell you where the file lives; `collect` finds it under `--search-dirs`. Matched case-insensitively. |
+| `taken` | ISO capture time, or empty | Only `--whole-day` reads it (to know which day to pull the rest of). Empty is fine otherwise. |
+
+```csv
+name,filename,taken
+Jan Novák,IMG_0001.jpg,2026-08-05T10:00:00+00:00
+Jan Novák,IMG_0004.heic,2026-08-09T09:00:00+00:00
+Petra Malá,IMG_0001.jpg,2026-08-05T10:00:00+00:00
+```
+
+One row per person **per photo**: a photo with three people tagged is three rows. Rows are
+sorted and deduplicated on write; order in the file carries no meaning.
+
+## Rows
+
+The file is read whole — unlike the sheet, an empty line does not stop parsing.
+
+## Where it comes from
+
+Nothing above is Google-specific, so write the file by hand or export it from another photo
+manager if you like. Google Takeout is currently the only *importer*, because the Google
+Photos API does not expose face tags at all and Takeout has no metadata-only export:
+`--takeout-dir` reads the `.json` sidecars straight out of the downloaded zip(s), never
+extracting a photo. Re-running merges into the existing index instead of overwriting it, so
+several Takeout exports can be accumulated.
+
+Note a photo that also sits in an album is exported twice by Takeout (once under
+`Photos from <year>/`, once under the album), so one person can be counted twice under two
+different file names.
+
+# Subcommands
+
+```
+slidershow-builder [build] --file x.ods   # sheet -> presentation HTML (implicit default)
+slidershow-builder build --dir folder     # ... or straight from a folder of media
+slidershow-builder people                 # who is on which photo (index for `collect --names`)
+slidershow-builder collect DEST           # symlink the matching originals into one folder
+slidershow-builder previews SOURCE        # thumbnails + fallback conversions for a media tree
+slidershow-builder fix-mtime SOURCE       # set mtime from EXIF/ffprobe capture time
+slidershow-builder probe FILE             # debug: codec, browser compatibility, capture time
+```
+
+Any of them takes `--config <yaml>` instead of a long command line; put the options under
+the subcommand's name:
+
+```yaml
+collect:
+  search_dirs: [/home/user/Photos, /mnt/backup]
+  names: ["Jan Novák"]
+  date_ranges: ["2026-08-05:2026-08-07"]
+```
+
+## Browser-incompatible files
+
+`collect --incompatible` decides what happens to HEIC/HEIF photos and videos in codecs no
+browser plays:
+
+| | |
+|---|---|
+| `replace` (default) | a converted `IMG_1234.heic.jpg` / `VID.mov.mp4` goes into DEST **instead of** the symlink — drop the folder into slidershow and it just works |
+| `fallback` | the original is symlinked and the conversion goes to `--fallback-dir` (default `DEST/.fallback`), the layout slidershow's `sli-fallback` attribute expects |
+| `link` | symlink only |
+
+## Thumbnails and fallbacks in the generated HTML
+
+`build` can point the presentation at what `collect`/`previews` produced, so a big photo
+shows a thumbnail while it downloads and a HEIC has something to fall back to:
 
 ```bash
-$ slidershow-builder --help
-usage: slidershow-builder [-h] [OPTIONS]
-
-╭─ options ──────────────────────────────────────────────────────────────────╮
-│ -h, --help                                                                 │
-│     show this help message and exit                                        │
-│ --verbose, -v                                                              │
-│     verbosity level, can be used multiple times to increase                │
-│ --file PATH                                                                │
-│     (required)                                                             │
-│ --sheet STR                                                                │
-│     Sheet name to process. If None, all will be processed and multiple     │
-│     files will be generated (if `--output` set).                           │
-│     (...)                                                                  │
-│ --output PATH                                                              │
-│     By default, the output is printed to the screen. (default: None)       │
-│ --replace-in-filename {[STR STR [STR STR ...]]}                            │
-│     If set, filename from the sheet will be replaced according to this.    │
-│        Ex: --replace-filename /mnt/user /mnt/foo jpg JPG -> filename       │
-│     /mnt/user/dir/img.jpg → /mnt/foo/dir/img.JPG (default: None)           │
-│ --filename-autosearch {[PATH [PATH ...]]}                                  │
-│     If the filename is without path and the file does not exist, try       │
-│     finding the file within these dirs. (default: None)                    │
-│ --no-filename-autosearch-cache                                             │
-│     Use a cache file for filename_autosearch, persistent accress program   │
-│     launches. (default: True)                                              │
-╰────────────────────────────────────────────────────────────────────────────╯
-╭─ convert options ──────────────────────────────────────────────────────────╮
-│ Auto-convert for browser-compatible formats.                               │
-│ Creates a cached copies with compatible JPG and MP4.                       │
-│ ────────────────────────────────────────────────────────────────────────── │
-│ --convert.enable                                                           │
-│     The cache will be used for needy media. (default: False)               │
-│ --convert.no-autogenerate                                                  │
-│     If .enable, generate all the needy media to the cache. (default: True) │
-│ --convert.cache-dir PATH                                                   │
-│     (default: /tmp)                                                        │
-│ --convert.no-heic                                                          │
-│     Generate JPG from HEIC. (default: True)                                │
-│ --convert.no-hevc                                                          │
-│     Generate MP4 from HEVC. (default: True)                                │
-│ --convert.no-hevc-in-mp4                                                   │
-│     Check for HEVC codec in MP4 video files. (default: True)               │
-╰────────────────────────────────────────────────────────────────────────────╯
-╭─ slidershow options ───────────────────────────────────────────────────────╮
-│ --slidershow.template PATH                                                 │
-│     HTML template the presentation is made of. (default: ...)              │
-│ --slidershow.url STR                                                       │
-│     The URL to be used for generating. Ex. you might want to use an        │
-│     offline local copy of the project. (default:                           │
-│     https://cdn.jsdelivr.net/gh/CZ-NIC/slidershow@main/slidershow/slidersh │
-│     ow.js)                                                                 │
-╰────────────────────────────────────────────────────────────────────────────╯
+slidershow-builder previews ./trip --preview-dir ./thumbs --fallback-dir ./fb
+slidershow-builder build --file trip.ods --output trip.html \
+    --slidershow.thumb thumbs --slidershow.fallback fb
 ```
+
+```html
+<main data-start sli-thumb="thumbs/{file}.webp" sli-fallback="fb/{file}.jpg fb/{file}.mp4">
+```
+
+A bare prefix is expanded to that layout; pass anything containing `{` to write the template
+yourself (placeholders `{dir} {file} {name} {ext}`). Both layouts key on the file's *name*,
+so they line up when the media sit in one folder — which is what `collect` gives you.
+
+# Usage
+
+Run `slidershow-builder <subcommand> --help`; every option is a field of a dataclass in
+`slidershow_builder/_lib/env.py` with its docstring as the help text.

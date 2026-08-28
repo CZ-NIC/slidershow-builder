@@ -3,14 +3,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-# Define persistent cache file
-cache_dir = Path.home() / ".cache" / "slidershow_builder"
-cache_dir.mkdir(parents=True, exist_ok=True)
-cache_file = cache_dir / "file_cache.json"
-cache = {}
+from .paths import CACHE_DIR
 
-
-CACHE_FILE = Path.home() / ".cache" / "slidershow_builder" / "file_cache.json"
+CACHE_FILE = CACHE_DIR / "file_cache.json"
 CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 cache: dict[str, str] = {}

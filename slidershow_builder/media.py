@@ -266,13 +266,20 @@ def to_h264(src: Path, dst: Path, *, crf: int = 20, preset: str = "veryfast", to
 
 
 def fix_mtime(path: Path, *, tools: Tools = DEFAULT_TOOLS) -> Optional[datetime]:
-    """Set mtime from capture time if it differs by more than 1s. Returns the new time, or None if unchanged."""
+    """Set mtime from capture time if it differs by more than 1s. Returns the new time, or None if unchanged.
+
+    A symlink gets **its own** mtime set, never its target's. A tree of symlinks (what
+    `collect` builds) points at somebody else's originals: the capture time is *read*
+    through the link, but nothing is ever written past it. Everything that walks a tree
+    goes through this function, so that guarantee holds for `previews --fix-mtime` too.
+    """
     captured = capture_time(path, tools=tools)
     if captured is None:
         return None
-    current = datetime.fromtimestamp(path.stat().st_mtime)
+    link = path.is_symlink()
+    current = datetime.fromtimestamp((os.lstat(path) if link else path.stat()).st_mtime)
     if abs((current - captured).total_seconds()) <= 1:
         return None
     ts = captured.timestamp()
-    os.utime(path, (ts, ts))
+    os.utime(path, (ts, ts), follow_symlinks=not link)
     return captured

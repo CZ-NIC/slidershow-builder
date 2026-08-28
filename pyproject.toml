@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slidershow_builder"
-version = "0.6.2"
+version = "0.7.0"
 description = "Slideshow builder"
 authors = [{ name = "Edvard Rejthar", email = "slidershow-builder@edvard.cz" }]
 readme = "README.md"
@@ -16,8 +16,9 @@ dependencies = ["mininterface[basic]"]
 [project.optional-dependencies]
 # needed for the `build` subcommand (spreadsheet -> HTML)
 build = ["ezodf", "lxml", "tqdm", "jinja2", "piexif"]
-# needed for `previews`/`fix-mtime`/`probe`, and for HEIC/HEVC auto-conversion during `build`
-media = ["pillow", "pillow-heif"]
+# needed for `previews`/`fix-mtime`/`probe`/`collect`, and for HEIC/HEVC auto-conversion during `build`
+# (`people` is pure stdlib, it needs nothing)
+media = ["pillow", "pillow-heif", "tqdm"]
 all = ["slidershow_builder[build,media]"]
 
 [tool.setuptools.package-data]

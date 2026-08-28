@@ -1,8 +1,11 @@
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
 from .optional_deps import MissingOptionalDependency
+
+logger = logging.getLogger(__name__)
 
 try:
     import piexif
@@ -23,7 +26,13 @@ def dms_to_dd(dms, ref: str) -> float:
 def read_exif(path: Path) -> tuple[Optional[str], Optional[tuple[float, float]], Optional[datetime]]:
     if piexif is None:
         raise MissingOptionalDependency("Reading EXIF", "build")
-    exif_data = piexif.load(str(path))
+    try:
+        exif_data = piexif.load(str(path))
+    except Exception as e:
+        # piexif reads JPEG/TIFF only, so every HEIC raises here — and a truncated JPEG can
+        # too. Neither is a reason to abort a presentation of thousands of files.
+        logger.debug("no EXIF from %s: %s", path, e)
+        return None, None, None
 
     # model
     model = None

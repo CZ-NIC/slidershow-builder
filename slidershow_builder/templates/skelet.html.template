@@ -8,7 +8,7 @@
 </head>
 
 <body>
-    <main data-start>
+    <main sli-start{main_attrs}>
         <section>
 {contents}
         </section>

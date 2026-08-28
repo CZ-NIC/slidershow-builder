@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from .exif import read_exif
 
+from ..media import kind_of
 from .find_file_recursive import find_file_recursive
 from .convert import IMAGE_SUFFIXES
 
@@ -16,12 +17,37 @@ logger = logging.getLogger(__name__)
 # TODO we should put exif to the <article> - add to the changelog
 # TODO we accept csv, or a mere dir that we crawl
 
+# Attribute names are slidershow's own `sli-<property>`, the only spelling `prop()` resolves
+# (verified against the released bundle); the `data-` names of old are not read at all.
 TEMPLATE_VIDEO = Template(
-    """<article{% if points %} data-video-points='[{{ points }}]'{% endif %}><video controls="controls" data-src="{{ src }}"></video></article>"""
+    """<article{% if points %} sli-video-points='[{{ points }}]'{% endif %}><video controls="controls" sli-src="{{ src }}"></video></article>"""
 )
 TEMPLATE_IMG = Template(
-    """<article{% if points %} data-step-points='{{ points }}'{% endif %}><img data-src="{{ src }}" {% if datetime %} data-datetime="{{ datetime }}"{% endif %}{% if device %} data-device="{{ device }}"{% endif %}{% if gps %} data-gps="{{ gps[0] }}, {{ gps[1] }}"{% endif %}/></article>"""
+    """<article{% if points %} sli-step-points='{{ points }}'{% endif %}><img sli-src="{{ src }}" {% if datetime %} sli-datetime="{{ datetime }}"{% endif %}{% if device %} sli-device="{{ device }}"{% endif %}{% if gps %} sli-gps="{{ gps[0] }}, {{ gps[1] }}"{% endif %}/></article>"""
 )
+#: The layout `previews`/`collect` write, expressed in slidershow's `{dir} {file} {name} {ext}`
+#: placeholders — the suffix is appended to the whole file name, see `cache.MirrorLayout`.
+THUMB_LAYOUT = "{prefix}{{file}}.webp"
+FALLBACK_LAYOUT = "{prefix}{{file}}.jpg {prefix}{{file}}.mp4"
+
+
+def media_attributes(thumb: str | None, fallback: str | None) -> str:
+    """`sli-thumb`/`sli-fallback` for <main>; frames inherit them (slidershow's `prop()`).
+
+    A value with no `{` is a bare directory prefix and gets expanded into the layout our own
+    `previews`/`collect` produce; anything else is the user's own template, passed through.
+    """
+    out = ""
+    for name, value, layout in (("sli-thumb", thumb, THUMB_LAYOUT),
+                                ("sli-fallback", fallback, FALLBACK_LAYOUT)):
+        if not value:
+            continue
+        if "{" not in value:
+            value = layout.format(prefix=value if value.endswith("/") else value + "/")
+        out += f' {name}="{value}"'
+    return out
+
+
 TEMPLATE_TEXT = """<article class="main">
                     <h1>{title}</h1>
                     <p>{text}</p>
@@ -135,6 +161,54 @@ def cell_value(val):
         return str(val).replace(".0", "")
     return str(val)
 
+
+def write_presentation(m, output: list[str], fname: Path | None) -> None:
+    template = m.env.slidershow.template.read_text()
+    attrs = media_attributes(m.env.slidershow.thumb, m.env.slidershow.fallback)
+    if attrs and "{main_attrs}" not in template:
+        logger.warning("--slidershow.template has no {main_attrs} placeholder, "
+                       "so --slidershow.thumb/--slidershow.fallback have no effect")
+    if not fname:
+        return
+    fname.write_text(template.format(
+        contents="\n".join(output), slidershow_url=m.env.slidershow.url, main_attrs=attrs))
+    print("Written to", fname)
+
+
+def render_media(m, path: Path, points: str = "") -> str:
+    """One media frame. `src` stays exactly the path we were given (relative paths in the
+    sheet/directory are what the HTML has to keep, they are resolved by the browser)."""
+    if kind_of(path) == "video":
+        return TEMPLATE_VIDEO.render(points=points, src=path)
+    device, gps, dt = read_exif(path) if m.env.read_exif else (None, None, None)
+    return TEMPLATE_IMG.render(points=points, src=path,
+                               datetime=dt.isoformat() if dt else None, device=device, gps=gps)
+
+
+def process_dir(m, directory: Path):
+    """Turn a folder of media into a presentation: one frame per file, ordered by name.
+
+    The counterpart of `process_sheet` for the case there is nothing to say about the files
+    beyond "show them" — notably a folder built by `collect`. Paths in the HTML stay relative
+    to `--output`'s directory when `--dir` is given relative, which is what makes the result
+    portable next to the media.
+    """
+    files = sorted(p for p in directory.rglob("*") if p.is_file() and kind_of(p) != "other")
+    if not files:
+        raise ValueError(f"No media files in {directory}")
+    print(f"Processing: {directory} ({len(files)} media files)")
+
+    output = []
+    for path in (pbar := tqdm(files)):
+        pbar.set_postfix_str(path.name)
+        out = render_media(m, Path(m.env.convert.run(path)))
+        if m.env.output:
+            output.append(out)
+        else:
+            print(out)
+    write_presentation(m, output, m.env.output)
+
+
 def process_sheet(m, suffix, sheet):
     print(f"Processing: {m.env.file} / {sheet.name}")
     output = []
@@ -216,12 +290,7 @@ def process_sheet(m, suffix, sheet):
                 print(comment)
             print(out)
 
-    if fname := m.env.output:
-        if suffix:
-            fname = fname.with_name(f"{fname.stem}_{sheet.name}{fname.suffix}")
-        fname.write_text(
-                m.env.slidershow.template.read_text().format(
-                    contents="\n".join(output), slidershow_url=m.env.slidershow.url
-                )
-            )
-        print("Written to", fname)
+    fname = m.env.output
+    if fname and suffix:
+        fname = fname.with_name(f"{fname.stem}_{sheet.name}{fname.suffix}")
+    write_presentation(m, output, fname)

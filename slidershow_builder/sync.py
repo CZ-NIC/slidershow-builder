@@ -23,7 +23,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Literal, Optional
+
+from tqdm import tqdm  # TODO switch to mininterface's own progress bar once it has one
 
 from .cache import MirrorLayout
 from .media import (
@@ -60,6 +62,10 @@ class FallbackTarget:
     dir: Path
     jpeg_quality: int = 92
     crf: int = 20
+    kinds: Literal["both", "photo", "video"] = "both"
+    """Which incompatible media to convert. Transcoding video is orders of magnitude more
+    expensive than converting a photo — hours of CPU and tens of GB for a large tree — so it
+    is worth being able to do the cheap half on its own."""
 
 
 @dataclass
@@ -206,7 +212,8 @@ def _sync_previews(
             report.removed.append(preview)
             log(f"- {rel}")
 
-    for rel in missing:
+    for rel in (pbar := tqdm(missing, desc="previews")):
+        pbar.set_postfix_str(rel)
         src = originals[rel]
         dst = layout.path_for(Path(rel), ".webp")
         created = _generate(
@@ -269,8 +276,11 @@ def _sync_fallbacks(
             pass
     before = dict(compat)
 
-    for rel, src in originals.items():
+    for rel, src in (pbar := tqdm(originals.items(), desc="fallbacks")):
+        pbar.set_postfix_str(rel)
         photo = kind_of(src) == "photo"
+        if target.kinds != "both" and (target.kinds == "photo") != photo:
+            continue
         dst = layout.path_for(Path(rel), ".jpg" if photo else ".mp4")
         if dst.is_file():
             continue
