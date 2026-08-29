@@ -9,7 +9,7 @@
 
 <body>
     <main sli-start{main_attrs}>
-        <section>
+        <section{section_attrs}>
 {contents}
         </section>
     </main>

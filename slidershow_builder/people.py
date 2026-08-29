@@ -60,6 +60,16 @@ def files_and_days(rows: Iterable[Row], names: set[str]) -> tuple[set[str], set[
     return filenames, days
 
 
+def taken_hints(rows: Iterable[Row], names: set[str]) -> dict[str, datetime]:
+    """Per-file tagged capture time for `names`, for `collect` to break a filename tie with
+    (see `Collect.date_tolerance_hours`) — only the rows that actually carry one."""
+    hints: dict[str, datetime] = {}
+    for name, filename, taken in rows:
+        if name in names and taken:
+            hints[filename] = datetime.fromisoformat(taken)
+    return hints
+
+
 # --- Google Takeout importer ------------------------------------------------
 
 def _iter_sidecars(takeout_dir: Path) -> Iterator[tuple[str, dict]]:

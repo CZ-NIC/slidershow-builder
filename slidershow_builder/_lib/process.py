@@ -8,7 +8,8 @@ from tqdm import tqdm
 
 from .exif import read_exif
 
-from ..media import kind_of
+from ..collect import DateIndex
+from ..media import DEFAULT_TOOLS, kind_of
 from .find_file_recursive import find_file_recursive
 from .convert import IMAGE_SUFFIXES
 
@@ -162,7 +163,7 @@ def cell_value(val):
     return str(val)
 
 
-def write_presentation(m, output: list[str], fname: Path | None) -> None:
+def write_presentation(m, output: list[str], fname: Path | None, section_title: str | None = None) -> None:
     template = m.env.slidershow.template.read_text()
     attrs = media_attributes(m.env.slidershow.thumb, m.env.slidershow.fallback)
     if attrs and "{main_attrs}" not in template:
@@ -170,8 +171,10 @@ def write_presentation(m, output: list[str], fname: Path | None) -> None:
                        "so --slidershow.thumb/--slidershow.fallback have no effect")
     if not fname:
         return
+    section_attrs = f' sli-title="{section_title}"' if section_title else ""
     fname.write_text(template.format(
-        contents="\n".join(output), slidershow_url=m.env.slidershow.url, main_attrs=attrs))
+        contents="\n".join(output), slidershow_url=m.env.slidershow.url, main_attrs=attrs,
+        section_attrs=section_attrs))
     print("Written to", fname)
 
 
@@ -186,27 +189,57 @@ def render_media(m, path: Path, points: str = "") -> str:
 
 
 def process_dir(m, directory: Path):
-    """Turn a folder of media into a presentation: one frame per file, ordered by name.
+    """Turn a folder of media into a presentation: one frame per file, ordered by name — or,
+    with `--group-by`, by capture time, with a section break wherever that day/week/month/year
+    changes.
 
     The counterpart of `process_sheet` for the case there is nothing to say about the files
     beyond "show them" — notably a folder built by `collect`. Paths in the HTML stay relative
     to `--output`'s directory when `--dir` is given relative, which is what makes the result
     portable next to the media.
     """
-    files = sorted(p for p in directory.rglob("*") if p.is_file() and kind_of(p) != "other")
+    files = [p for p in directory.rglob("*") if p.is_file() and kind_of(p) != "other"]
     if not files:
         raise ValueError(f"No media files in {directory}")
+
+    group_by = m.env.group_by
+    if group_by:
+        # Same cache `collect --whole-day`/`previews` use, keyed by path|size|mtime, so a
+        # rebuild of the same folder does not ffprobe/re-read EXIF of every file again.
+        # `sort(key=...)` has no per-item hook of its own, and reading a HEIC/video's date can
+        # stall on slow storage, so the dates are read in their own tqdm-visible pass first.
+        dates = DateIndex(DEFAULT_TOOLS)
+        dated = []
+        for path in (pbar := tqdm(files, desc="reading dates")):
+            pbar.set_postfix_str(path.name)
+            dated.append((dates.taken(path), path))
+        dated.sort(key=lambda pair: pair[0])
+        files = [path for _, path in dated]
+    else:
+        files.sort()
+
     print(f"Processing: {directory} ({len(files)} media files)")
 
     output = []
+    prev_key = None
+    first_key = None
     for path in (pbar := tqdm(files)):
         pbar.set_postfix_str(path.name)
+        if group_by:
+            key = dates.group_key(path, group_by)
+            if prev_key is None:
+                first_key = key
+            elif key != prev_key:
+                output.append(f'</section><section sli-title="{key}">')
+            prev_key = key
         out = render_media(m, Path(m.env.convert.run(path)))
         if m.env.output:
             output.append(out)
         else:
             print(out)
-    write_presentation(m, output, m.env.output)
+    if group_by:
+        dates.save()
+    write_presentation(m, output, m.env.output, section_title=first_key)
 
 
 def process_sheet(m, suffix, sheet):
@@ -231,7 +264,8 @@ def process_sheet(m, suffix, sheet):
             suff = path.suffix.lower()
             device, gps, dt = None, None, None
             if suff in IMAGE_SUFFIXES:
-                device, gps, dt = read_exif(path) # TODO UPRAV SABLONU
+                if m.env.read_exif:
+                    device, gps, dt = read_exif(path) # TODO UPRAV SABLONU
 
                 template = TEMPLATE_IMG
                 points = start or ""

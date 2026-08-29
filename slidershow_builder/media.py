@@ -32,6 +32,11 @@ except ImportError:  # HEIC just won't open; only matters if a .heic file is tou
 
 logger = logging.getLogger(__name__)
 
+FFPROBE_TIMEOUT = 15
+"""Seconds. Reading a container's own header is normally instant; a hang usually means the
+file sits on unresponsive storage (a stalled network mount, a drive that went to sleep) rather
+than a slow probe, so this exists to fail that file rather than block the whole run forever."""
+
 
 def _require_pillow():
     if not _PILLOW_AVAILABLE:
@@ -97,10 +102,10 @@ def _ffprobe_streams(path: Path, tools: Tools) -> tuple[Optional[str], Optional[
                 "-show_entries", "stream=codec_type,codec_name",
                 "-of", "json", str(path),
             ],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=FFPROBE_TIMEOUT,
         )
         streams = json.loads(result.stdout).get("streams", [])
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, ValueError):
         return None, None
     vcodec = acodec = None
     for stream in streams:
@@ -119,9 +124,9 @@ def _ffprobe_creation_time(path: Path, tools: Tools) -> Optional[datetime]:
                 "-show_entries", "format_tags=creation_time",
                 "-of", "default=nokey=1:noprint_wrappers=1", str(path),
             ],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=FFPROBE_TIMEOUT,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
     raw = result.stdout.strip()
     if not raw:

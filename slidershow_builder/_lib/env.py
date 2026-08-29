@@ -59,6 +59,11 @@ class Env:
         slidershow-builder build --dir trip --output trip.html
     """
 
+    group_by: Literal["day", "week", "month", "year"] | None = None
+    """Only with --dir: order frames by capture time (EXIF/ffprobe, falling back to mtime)
+    instead of by name, and insert a section break wherever that value changes from one file
+    to the next — e.g. --group-by week starts a new <section> on every ISO week boundary."""
+
     sheet: str | None = None
     """ Sheet name to process. If None, all will be processed and multiple files will be generated (if `--output` set).
 
@@ -125,6 +130,10 @@ class Env:
 
     read_exif: bool = True
     """ Adds EXIF info to the HTML. The same way as if the file was dragged into a live Slidershow session """
+
+    read_exif_cache: bool = True
+    """Cache read EXIF (path|size|mtime) across program launches, so a repeated build over
+    the same files does not re-read/re-decode their EXIF every time."""
 
 
 @dataclass
@@ -255,19 +264,33 @@ class Collect:
     Columns `name,filename,taken`:
       name — person's name, exactly as --names spells it (free text)
       filename — base name of the original, no path; `collect` finds it under --search-dirs, case-insensitively
-      taken — ISO capture time, or empty; only --whole-day reads it
+      taken — ISO capture time, or empty; used by --whole-day and to break a tie when a
+              filename matches more than one file on disk (see --date-tolerance-hours)
     One row per person *per photo*, e.g. `Jan Novák,IMG_0001.jpg,2026-08-05T10:00:00+00:00`.
     The whole file is read (unlike the sheet, an empty line does not stop parsing) and rows are
     sorted/deduplicated on write, so their order means nothing. Nothing here is Google-specific —
     hand-write the file if you like; Takeout is only the one importer that exists.
     """
 
+    date_tolerance_hours: float = 12
+    """A filename matching more than one file on disk (a camera's counter can repeat across
+    years) is resolved by comparing each candidate's own capture time to the index's tagged
+    `taken` date; this is how far apart the two may be and still count as the same photo.
+    Kept generous by default because `taken` usually came through a different pipeline
+    (e.g. Google Photos) than the file's own EXIF and the two can disagree by a few hours."""
+
+    interactive: bool = True
+    """When a filename's candidates can't be told apart even with --date-tolerance-hours, ask
+    which one to use instead of silently taking the first (a dialog, batching every such case
+    into one screen). False keeps the old silent behavior — for unattended/cron runs."""
+
     set_mtime: bool = True
     """Stamp each symlink's own mtime with the photo's capture time, so DEST sorts
     chronologically. The originals are never touched."""
 
     date_cache: bool = True
-    """Cache capture times across runs (only read when --whole-day/--date-ranges is used)."""
+    """Cache capture times across runs (read whenever --whole-day/--date-ranges is used, or a
+    filename matches more than one file on disk)."""
 
     dry_run: bool = False
     """Print what would happen, create nothing."""

@@ -2,16 +2,20 @@
 import json
 import logging
 import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from mininterface import run
+from mininterface import Mininterface, run
+from mininterface.tag import SelectTag
 from tyro.conf import DisallowNone, FlagCreatePairsOff
 
 from . import people as _people
 from ._lib.env import Build, Collect, FixMtime, People, Previews, Probe
+from ._lib.exif import read_exif_cache
 from ._lib.find_file_recursive import filename_cache
 from ._lib.optional_deps import MissingOptionalDependency
-from .collect import collect as _collect, parse_days
-from .media import fix_mtime as _fix_mtime, probe as _probe
+from .collect import ResolveAmbiguous, collect as _collect, parse_days
+from .media import capture_time as _capture_time, fix_mtime as _fix_mtime, probe as _probe
 from .sync import FallbackTarget, PreviewTarget, sync_tree
 
 logger = logging.getLogger(__name__)
@@ -32,42 +36,43 @@ def _run_build(env: Build):
     if bool(env.file) == bool(env.dir):
         raise SystemExit("Pass either --file (a spreadsheet) or --dir (a folder of media)")
 
-    if env.dir:
+    with read_exif_cache(env.read_exif_cache):
+        if env.dir:
+            try:
+                from ._lib.process import process_dir
+            except ImportError as e:
+                raise MissingOptionalDependency("Building a slidershow", "build") from e
+            if not env.dir.is_dir():
+                raise SystemExit(f"Not a directory: {env.dir}")
+            process_dir(_BuildShim(env), env.dir)
+            return
+
         try:
-            from ._lib.process import process_dir
+            import ezodf
+
+            from ._lib.process import process_sheet
         except ImportError as e:
-            raise MissingOptionalDependency("Building a slidershow", "build") from e
-        if not env.dir.is_dir():
-            raise SystemExit(f"Not a directory: {env.dir}")
-        process_dir(_BuildShim(env), env.dir)
-        return
+            raise MissingOptionalDependency("Building a slidershow from a spreadsheet", "build") from e
 
-    try:
-        import ezodf
+        if not env.file.exists():
+            print("File does not exists", env.file)
+            quit()
+        sheets = ezodf.opendoc(env.file).sheets
 
-        from ._lib.process import process_sheet
-    except ImportError as e:
-        raise MissingOptionalDependency("Building a slidershow from a spreadsheet", "build") from e
-
-    if not env.file.exists():
-        print("File does not exists", env.file)
-        quit()
-    sheets = ezodf.opendoc(env.file).sheets
-
-    if env.sheet:
-        for s in sheets:
-            if s.name == env.sheet:
-                sheets = [s]
-                break
+        if env.sheet:
+            for s in sheets:
+                if s.name == env.sheet:
+                    sheets = [s]
+                    break
+            else:
+                raise ValueError(f"Sheet {env.sheet} not found")
+            suffix = False
         else:
-            raise ValueError(f"Sheet {env.sheet} not found")
-        suffix = False
-    else:
-        suffix = True
+            suffix = True
 
-    with filename_cache(env.filename_autosearch_cache):
-        for sheet in sheets:
-            process_sheet(_BuildShim(env), suffix, sheet)
+        with filename_cache(env.filename_autosearch_cache):
+            for sheet in sheets:
+                process_sheet(_BuildShim(env), suffix, sheet)
 
 
 class _BuildShim:
@@ -101,14 +106,45 @@ def _run_previews(env: Previews):
         )
 
 
-def _run_collect(env: Collect):
+def _resolve_ambiguous_interactively(m: Mininterface, tools) -> ResolveAmbiguous:
+    """One dialog for every filename the date heuristic couldn't settle, not one per file:
+    first ask how the user wants to spend their attention, then — only if they want to look —
+    a single form with a dropdown per filename."""
+
+    def resolve(cases: dict[str, list[Path]]) -> dict[str, Path | None]:
+        choice = m.select({
+            f"Go through all {len(cases)} in a form": "form",
+            "Drop all of them (leave as not found)": "skip",
+            "Always take the first candidate found": "first",
+        }, title=f"The date could not resolve {len(cases)} duplicate filename(s)")
+        if choice == "first":
+            return {name: candidates[0] for name, candidates in cases.items()}
+        if choice == "skip":
+            return {name: None for name in cases}
+        fields = {
+            name: SelectTag(
+                val=candidates[0],
+                options={f"{c} ({_capture_time(c, tools=tools)})": c for c in candidates},
+                description=f"{len(candidates)} files on disk share this name",
+            )
+            for name, candidates in cases.items()
+        }
+        return dict(m.form(fields, title="Resolve duplicate filenames"))
+
+    return resolve
+
+
+def _run_collect(m: Mininterface):
+    env: Collect = m.env
     filenames: set[str] = set()
     person_days: set[str] = set()
+    taken_hint: dict[str, datetime] = {}
     if env.names:
         rows = _people.read_index(env.index)
         if not rows:
             raise SystemExit(f"No people index at {env.index} — run `slidershow-builder people --takeout-dir ...` first")
         filenames, person_days = _people.files_and_days(rows, set(env.names))
+        taken_hint = _people.taken_hints(rows, set(env.names))
         if not filenames:
             known = ", ".join(sorted(_people.counts(rows))) or "(none)"
             raise SystemExit(f"Nobody named {sorted(env.names)!r} in {env.index}. Known: {known}")
@@ -125,6 +161,9 @@ def _run_collect(env: Collect):
         filenames=filenames,
         days=days,
         whole_day_of=person_days if env.whole_day else (),
+        taken_hint=taken_hint,
+        date_tolerance=timedelta(hours=env.date_tolerance_hours),
+        resolve_ambiguous=_resolve_ambiguous_interactively(m, env.tools) if env.interactive else None,
         incompatible=env.incompatible,
         set_mtime=env.set_mtime,
         dry_run=env.dry_run,
@@ -210,7 +249,7 @@ def main():
             case Build():
                 _run_build(m.env)
             case Collect():
-                _run_collect(m.env)
+                _run_collect(m)
             case People():
                 _run_people(m.env)
             case Previews():

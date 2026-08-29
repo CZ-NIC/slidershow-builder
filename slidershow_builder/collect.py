@@ -19,6 +19,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional
 
+from tqdm import tqdm  # TODO switch to mininterface's own progress bar once it has one
+
 from ._lib.paths import CACHE_DIR
 from .media import (
     DEFAULT_TOOLS,
@@ -38,6 +40,12 @@ DATE_CACHE = CACHE_DIR / "capture_time.json"
 video) of the whole search tree; without this, every re-run pays that again."""
 
 Incompatible = Literal["replace", "fallback", "link"]
+
+ResolveAmbiguous = Callable[[dict[str, list[Path]]], dict[str, Optional[Path]]]
+"""Given every filename that a date match couldn't settle (each mapped to its candidates),
+return a chosen `Path` per filename the caller wants to decide. A filename absent from the
+result falls back to the first candidate; a filename mapped to `None` is dropped (goes into
+`CollectReport.missing`) rather than collected at all."""
 
 
 @dataclass
@@ -78,7 +86,7 @@ def parse_days(specs: Iterable[str]) -> set[str]:
     return days
 
 
-class _DateIndex:
+class DateIndex:
     """`file -> the day it was taken`, cached across runs, mtime fallback for the undated."""
 
     def __init__(self, tools: Tools, use_cache: bool = True):
@@ -94,7 +102,7 @@ class _DateIndex:
             except (OSError, ValueError):
                 pass
 
-    def taken(self, path: Path) -> datetime:
+    def _entry(self, path: Path) -> list:
         stat = path.stat()
         key = str(path)
         entry = self.cache.get(key)
@@ -103,12 +111,36 @@ class _DateIndex:
             entry = [stat.st_size, int(stat.st_mtime), captured.isoformat() if captured else None]
             self.cache[key] = entry
             self.dirty = True
+        return entry
+
+    def taken(self, path: Path) -> datetime:
+        entry = self._entry(path)
         if entry[2]:
             return datetime.fromisoformat(entry[2])
-        return datetime.fromtimestamp(stat.st_mtime)
+        return datetime.fromtimestamp(path.stat().st_mtime)
+
+    def captured(self, path: Path) -> Optional[datetime]:
+        """Like `taken()`, but None rather than an mtime guess when nothing was read from
+        EXIF/ffprobe — a bare mtime is when a file was copied, not when it was shot, so it must
+        not be trusted to break a filename tie between two unrelated photos."""
+        entry = self._entry(path)
+        return datetime.fromisoformat(entry[2]) if entry[2] else None
 
     def day(self, path: Path) -> str:
         return self.taken(path).date().isoformat()
+
+    def group_key(self, path: Path, unit: Literal["day", "week", "month", "year"]) -> str:
+        """`day()` generalized to any calendar unit — backs `build --dir --group-by`, so a
+        folder of media can be split into sections without a spreadsheet's SECTION rows."""
+        dt = self.taken(path)
+        if unit == "day":
+            return dt.date().isoformat()
+        if unit == "week":
+            iso_year, iso_week, _ = dt.isocalendar()
+            return f"{iso_year}-W{iso_week:02d}"
+        if unit == "month":
+            return f"{dt.year}-{dt.month:02d}"
+        return str(dt.year)
 
     def save(self) -> None:
         if self.use_cache and self.dirty:
@@ -116,24 +148,29 @@ class _DateIndex:
             DATE_CACHE.write_text(json.dumps(self.cache))
 
 
-def _index(search_dirs: Iterable[Path], excluded: set[Path], dates: Optional[_DateIndex],
-           log: Callable[[str], None]) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
+def _index(search_dirs: Iterable[Path], excluded: set[Path], dates: Optional[DateIndex],
+           index_days: bool, log: Callable[[str], None],
+           ) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
     by_name: dict[str, list[Path]] = {}
     by_day: dict[str, list[Path]] = {}
-    for base in search_dirs:
-        if not base.is_dir():
-            log(f"! not a directory, skipped: {base}")
-            continue
-        for path in base.rglob("*"):
-            if not path.is_file() or kind_of(path) == "other":
+    pbar = tqdm(desc="indexing", unit="file", disable=not index_days)
+    with pbar:
+        for base in search_dirs:
+            if not base.is_dir():
+                log(f"! not a directory, skipped: {base}")
                 continue
-            # A destination nested in a search dir would otherwise be re-collected into
-            # itself, linking symlinks to symlinks on every run.
-            if any(d == path.parent or d in path.parents for d in excluded):
-                continue
-            by_name.setdefault(path.name.lower(), []).append(path)
-            if dates is not None:
-                by_day.setdefault(dates.day(path), []).append(path)
+            for path in base.rglob("*"):
+                if not path.is_file() or kind_of(path) == "other":
+                    continue
+                # A destination nested in a search dir would otherwise be re-collected into
+                # itself, linking symlinks to symlinks on every run.
+                if any(d == path.parent or d in path.parents for d in excluded):
+                    continue
+                by_name.setdefault(path.name.lower(), []).append(path)
+                if index_days:
+                    pbar.set_postfix_str(path.name)
+                    by_day.setdefault(dates.day(path), []).append(path)
+                    pbar.update()
     return by_name, by_day
 
 
@@ -176,6 +213,37 @@ def _replacement_suffix(source: Path, tools: Tools) -> Optional[str]:
     return None
 
 
+def _pick_by_date(
+    candidates: list[Path], hint: Optional[datetime], tolerance: timedelta, dates: DateIndex,
+    pbar: Optional[tqdm] = None,
+) -> Optional[Path]:
+    """The one candidate whose own capture time sits closest to `hint`, within `tolerance` — or
+    None if there is no hint or nothing is close enough. A camera's filename counter can repeat
+    across years (`DSC09253.JPG` shot twice, a year apart), so a bare filename match is not
+    enough; the index's tagged date breaks the tie. The tolerance exists because that tagged
+    date usually came from a different pipeline (e.g. Google Photos) than the file's own EXIF
+    and the two can disagree by a few hours.
+
+    Several candidates tied for closest is not itself ambiguous — the same photo is routinely
+    backed up under more than one path (a yearly archive, a curated subfolder, an old backup
+    disk) — so we just pick one of them rather than giving up."""
+    if hint is None:
+        return None
+    scored = []
+    for path in candidates:
+        if pbar is not None:
+            pbar.set_postfix_str(path.name)
+        taken = dates.captured(path)
+        if taken is None:
+            continue
+        diff = abs((taken.replace(tzinfo=None) - hint.replace(tzinfo=None)).total_seconds())
+        if diff <= tolerance.total_seconds():
+            scored.append((diff, path))
+    if not scored:
+        return None
+    return min(scored, key=lambda pair: pair[0])[1]
+
+
 def collect(
     dest: Path,
     *,
@@ -183,6 +251,9 @@ def collect(
     filenames: Iterable[str] = (),
     days: Iterable[str] = (),
     whole_day_of: Iterable[str] = (),
+    taken_hint: dict[str, datetime] = {},
+    date_tolerance: timedelta = timedelta(hours=12),
+    resolve_ambiguous: Optional[ResolveAmbiguous] = None,
     incompatible: Incompatible = "replace",
     set_mtime: bool = True,
     dry_run: bool = False,
@@ -197,27 +268,66 @@ def collect(
     are ISO days matched against capture time. `whole_day_of` exists so that a person's
     tagged photos can drag in the rest of that day's outing — it is a separate argument
     only so the report can tell the two apart.
+
+    A filename with more than one candidate on disk is resolved by `taken_hint` (the index's
+    tagged capture time for that name, if any) within `date_tolerance`; what that still can't
+    settle goes to `resolve_ambiguous` — called once with every such filename, so a caller can
+    offer them all in a single batch rather than one dialog per file — or, absent a callback,
+    to the first candidate found (the old behavior).
     """
     report = CollectReport()
     log = on_event or logger.info
     dest = dest.expanduser()
 
     wanted_days = set(days) | set(whole_day_of)
-    dates = _DateIndex(tools, date_cache) if wanted_days else None
+    # A `DateIndex` is cheap to have around (just a JSON cache load) and disambiguating
+    # `filenames` needs one; only actually walking every file's date is expensive, and that
+    # stays gated on `wanted_days` alone, same as before.
+    dates = DateIndex(tools, date_cache) if (wanted_days or filenames) else None
     excluded_dirs = {p.resolve() for p in (*excluded, dest) if p.exists() or p == dest}
-    by_name, by_day = _index(search_dirs, excluded_dirs, dates, log)
+    by_name, by_day = _index(search_dirs, excluded_dirs, dates, bool(wanted_days), log)
 
     # resolved original -> why it was picked, for the report and for stable de-duplication
     sources: dict[Path, str] = {}
+    ambiguous: dict[str, list[Path]] = {}
     for filename in sorted(set(filenames)):
         candidates = by_name.get(filename.lower(), [])
         if not candidates:
             report.missing.append(filename)
-            continue
-        if len(candidates) > 1:
+        elif len(candidates) == 1:
+            sources.setdefault(candidates[0].resolve(), "match")
+        else:
             report.ambiguous[filename] = candidates
-            log(f"! {filename}: {len(candidates)} candidates, using the first")
-        sources.setdefault(candidates[0].resolve(), "match")
+            ambiguous[filename] = candidates
+
+    unresolved: dict[str, list[Path]] = {}
+    # One bar for the whole phase — a ffprobe call per candidate can take up to
+    # FFPROBE_TIMEOUT, so without it a long resolve looks like a hang rather than progress.
+    with tqdm(ambiguous.items(), desc="disambiguating", unit="name",
+              disable=not ambiguous) as pbar:
+        for filename, candidates in pbar:
+            pbar.set_postfix_str(filename)
+            chosen = _pick_by_date(candidates, taken_hint.get(filename), date_tolerance, dates, pbar)
+            if chosen is not None:
+                sources.setdefault(chosen.resolve(), "match")
+            else:
+                unresolved[filename] = candidates
+
+    if unresolved:
+        resolved = resolve_ambiguous(unresolved) if resolve_ambiguous else {}
+        for filename, candidates in unresolved.items():
+            if filename in resolved:
+                chosen = resolved[filename]
+                if chosen is None:
+                    log(f"- {filename}: dropped by the user, {len(candidates)} candidates")
+                    report.missing.append(filename)
+                    continue
+                log(f"? {filename}: {len(candidates)} candidates, resolved by the user")
+            else:
+                chosen = candidates[0]
+                log(f"! {filename}: {len(candidates)} candidates, no date match, using the first")
+            sources.setdefault(chosen.resolve(), "match")
+
     for day in sorted(wanted_days):
         reason = "whole-day" if day in set(whole_day_of) else "date-range"
         for path in by_day.get(day, []):
@@ -228,7 +338,8 @@ def collect(
     if not dry_run:
         dest.mkdir(parents=True, exist_ok=True)
 
-    for source in sorted(sources):
+    for source in (pbar := tqdm(sorted(sources), desc="collecting", unit="file")):
+        pbar.set_postfix_str(source.name)
         replacement = _replacement_suffix(source, tools) if incompatible == "replace" else None
         if replacement:
             # `IMG_0004.heic.jpg`, the suffix appended rather than substituted — same
