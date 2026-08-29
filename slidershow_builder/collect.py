@@ -21,6 +21,7 @@ from typing import Callable, Iterable, Literal, Optional
 
 from tqdm import tqdm  # TODO switch to mininterface's own progress bar once it has one
 
+from . import people as _people
 from ._lib.paths import CACHE_DIR
 from .media import (
     DEFAULT_TOOLS,
@@ -32,6 +33,7 @@ from .media import (
     to_h264,
     to_jpeg,
 )
+from .people import Row
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,7 @@ DATE_CACHE = CACHE_DIR / "capture_time.json"
 video) of the whole search tree; without this, every re-run pays that again."""
 
 Incompatible = Literal["replace", "fallback", "link"]
+PeopleMode = Literal["union", "intersection"]
 
 ResolveAmbiguous = Callable[[dict[str, list[Path]]], dict[str, Optional[Path]]]
 """Given every filename that a date match couldn't settle (each mapped to its candidates),
@@ -244,13 +247,135 @@ def _pick_by_date(
     return min(scored, key=lambda pair: pair[0])[1]
 
 
+@dataclass
+class ResolvedPeople:
+    """Output of `resolve_people`: source paths plus the same missing/ambiguous
+    diagnostics `CollectReport` carries, with no destination/symlink concerns baked in."""
+
+    paths: list[Path] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    ambiguous: dict[str, list[Path]] = field(default_factory=dict)
+    dates: Optional[DateIndex] = None
+    """The capture-time cache built while resolving, if any (whole_day/dates were used, or a
+    filename matched more than one file on disk) — reused by `collect()` so mtime-stamping does
+    not pay for the same ffprobe/EXIF read twice."""
+
+
+def resolve_people(
+    index_rows: set[Row],
+    names: Iterable[str],
+    search_dirs: Iterable[Path],
+    *,
+    excluded: Iterable[Path] = (),
+    whole_day: bool = False,
+    dates: Iterable[str] = (),
+    mode: PeopleMode = "union",
+    taken_hint: dict[str, datetime] = {},
+    date_tolerance: timedelta = timedelta(hours=12),
+    resolve_ambiguous: Optional[ResolveAmbiguous] = None,
+    tools: Tools = DEFAULT_TOOLS,
+    date_cache: bool = True,
+    on_event: Optional[Callable[[str], None]] = None,
+) -> ResolvedPeople:
+    """Names + explicit calendar days -> resolved source paths. No writing, no `dest` —
+    the piece `collect` and `build --people` both need before they go their separate ways
+    (symlinking vs. rendering straight into HTML).
+
+    `names` are looked up in `index_rows` (`people.read_index()`'s output). `dates` are ISO
+    days wanted regardless of who is on the photo (`--date-ranges`). `mode` picks "at least
+    one of `names`" (union — `people.files_and_days`'s own behaviour) or "all of `names`
+    together" (intersection, computed per-name since the index otherwise collapses several
+    names into one combined set). `whole_day` additionally pulls in everything taken on a
+    day any selected photo was taken on.
+
+    A filename with more than one candidate on disk is resolved by `taken_hint` (the index's
+    tagged capture time for that name, if any) within `date_tolerance`; what that still can't
+    settle goes to `resolve_ambiguous` — called once with every such filename, so a caller can
+    offer them all in a single batch rather than one dialog per file — or, absent a callback,
+    to the first candidate found (the old behavior).
+    """
+    names = set(names)
+    log = on_event or logger.info
+    result = ResolvedPeople()
+
+    filenames: set[str] = set()
+    person_days: set[str] = set()
+    if names:
+        if mode == "union":
+            filenames, person_days = _people.files_and_days(index_rows, names)
+        else:
+            by_name = _people.files_by_name(index_rows, names)
+            filenames = set.intersection(*by_name.values()) if by_name else set()
+            person_days = _people.days_for_files(index_rows, filenames)
+
+    wanted_days = set(dates) | (person_days if whole_day else set())
+    # A `DateIndex` is cheap to have around (just a JSON cache load) and disambiguating
+    # `filenames` needs one; only actually walking every file's date is expensive, and that
+    # stays gated on `wanted_days` alone, same as before.
+    date_index = DateIndex(tools, date_cache) if (wanted_days or filenames) else None
+    excluded_dirs = {p.resolve() for p in excluded}
+    by_name_idx, by_day_idx = _index(search_dirs, excluded_dirs, date_index, bool(wanted_days), log)
+
+    sources: dict[Path, None] = {}
+    ambiguous: dict[str, list[Path]] = {}
+    for filename in sorted(filenames):
+        candidates = by_name_idx.get(filename.lower(), [])
+        if not candidates:
+            result.missing.append(filename)
+        elif len(candidates) == 1:
+            sources.setdefault(candidates[0].resolve())
+        else:
+            result.ambiguous[filename] = candidates
+            ambiguous[filename] = candidates
+
+    unresolved: dict[str, list[Path]] = {}
+    # One bar for the whole phase — a ffprobe call per candidate can take up to
+    # FFPROBE_TIMEOUT, so without it a long resolve looks like a hang rather than progress.
+    with tqdm(ambiguous.items(), desc="disambiguating", unit="name",
+              disable=not ambiguous) as pbar:
+        for filename, candidates in pbar:
+            pbar.set_postfix_str(filename)
+            chosen = _pick_by_date(candidates, taken_hint.get(filename), date_tolerance, date_index, pbar)
+            if chosen is not None:
+                sources.setdefault(chosen.resolve())
+            else:
+                unresolved[filename] = candidates
+
+    if unresolved:
+        resolved_choice = resolve_ambiguous(unresolved) if resolve_ambiguous else {}
+        for filename, candidates in unresolved.items():
+            if filename in resolved_choice:
+                chosen = resolved_choice[filename]
+                if chosen is None:
+                    log(f"- {filename}: dropped by the user, {len(candidates)} candidates")
+                    result.missing.append(filename)
+                    continue
+                log(f"? {filename}: {len(candidates)} candidates, resolved by the user")
+            else:
+                chosen = candidates[0]
+                log(f"! {filename}: {len(candidates)} candidates, no date match, using the first")
+            sources.setdefault(chosen.resolve())
+
+    for day in sorted(wanted_days):
+        for path in by_day_idx.get(day, []):
+            sources.setdefault(path.resolve())
+    if date_index is not None:
+        date_index.save()
+
+    result.paths = sorted(sources)
+    result.dates = date_index
+    return result
+
+
 def collect(
     dest: Path,
     *,
     search_dirs: list[Path],
-    filenames: Iterable[str] = (),
+    names: Iterable[str] = (),
+    index_rows: set[Row] = frozenset(),
     days: Iterable[str] = (),
-    whole_day_of: Iterable[str] = (),
+    whole_day: bool = False,
+    mode: PeopleMode = "union",
     taken_hint: dict[str, datetime] = {},
     date_tolerance: timedelta = timedelta(hours=12),
     resolve_ambiguous: Optional[ResolveAmbiguous] = None,
@@ -264,81 +389,29 @@ def collect(
 ) -> CollectReport:
     """Symlink every matching original into `dest`.
 
-    `filenames` are matched by base name (case-insensitively); `days` and `whole_day_of`
-    are ISO days matched against capture time. `whole_day_of` exists so that a person's
-    tagged photos can drag in the rest of that day's outing — it is a separate argument
-    only so the report can tell the two apart.
-
-    A filename with more than one candidate on disk is resolved by `taken_hint` (the index's
-    tagged capture time for that name, if any) within `date_tolerance`; what that still can't
-    settle goes to `resolve_ambiguous` — called once with every such filename, so a caller can
-    offer them all in a single batch rather than one dialog per file — or, absent a callback,
-    to the first candidate found (the old behavior).
+    `names` are looked up in `index_rows` and matched by base name (case-insensitively);
+    `days` and (when `whole_day`) the days the named people were photographed on are matched
+    against capture time. Selection itself is `resolve_people`'s job — this just writes it
+    (or converts it) into `dest`.
     """
     report = CollectReport()
     log = on_event or logger.info
     dest = dest.expanduser()
 
-    wanted_days = set(days) | set(whole_day_of)
-    # A `DateIndex` is cheap to have around (just a JSON cache load) and disambiguating
-    # `filenames` needs one; only actually walking every file's date is expensive, and that
-    # stays gated on `wanted_days` alone, same as before.
-    dates = DateIndex(tools, date_cache) if (wanted_days or filenames) else None
     excluded_dirs = {p.resolve() for p in (*excluded, dest) if p.exists() or p == dest}
-    by_name, by_day = _index(search_dirs, excluded_dirs, dates, bool(wanted_days), log)
-
-    # resolved original -> why it was picked, for the report and for stable de-duplication
-    sources: dict[Path, str] = {}
-    ambiguous: dict[str, list[Path]] = {}
-    for filename in sorted(set(filenames)):
-        candidates = by_name.get(filename.lower(), [])
-        if not candidates:
-            report.missing.append(filename)
-        elif len(candidates) == 1:
-            sources.setdefault(candidates[0].resolve(), "match")
-        else:
-            report.ambiguous[filename] = candidates
-            ambiguous[filename] = candidates
-
-    unresolved: dict[str, list[Path]] = {}
-    # One bar for the whole phase — a ffprobe call per candidate can take up to
-    # FFPROBE_TIMEOUT, so without it a long resolve looks like a hang rather than progress.
-    with tqdm(ambiguous.items(), desc="disambiguating", unit="name",
-              disable=not ambiguous) as pbar:
-        for filename, candidates in pbar:
-            pbar.set_postfix_str(filename)
-            chosen = _pick_by_date(candidates, taken_hint.get(filename), date_tolerance, dates, pbar)
-            if chosen is not None:
-                sources.setdefault(chosen.resolve(), "match")
-            else:
-                unresolved[filename] = candidates
-
-    if unresolved:
-        resolved = resolve_ambiguous(unresolved) if resolve_ambiguous else {}
-        for filename, candidates in unresolved.items():
-            if filename in resolved:
-                chosen = resolved[filename]
-                if chosen is None:
-                    log(f"- {filename}: dropped by the user, {len(candidates)} candidates")
-                    report.missing.append(filename)
-                    continue
-                log(f"? {filename}: {len(candidates)} candidates, resolved by the user")
-            else:
-                chosen = candidates[0]
-                log(f"! {filename}: {len(candidates)} candidates, no date match, using the first")
-            sources.setdefault(chosen.resolve(), "match")
-
-    for day in sorted(wanted_days):
-        reason = "whole-day" if day in set(whole_day_of) else "date-range"
-        for path in by_day.get(day, []):
-            sources.setdefault(path.resolve(), reason)
-    if dates is not None:
-        dates.save()
+    resolved = resolve_people(
+        index_rows, names, search_dirs, excluded=excluded_dirs, whole_day=whole_day,
+        dates=days, mode=mode, taken_hint=taken_hint, date_tolerance=date_tolerance,
+        resolve_ambiguous=resolve_ambiguous, tools=tools, date_cache=date_cache, on_event=log,
+    )
+    report.missing = resolved.missing
+    report.ambiguous = resolved.ambiguous
+    dates = resolved.dates
 
     if not dry_run:
         dest.mkdir(parents=True, exist_ok=True)
 
-    for source in (pbar := tqdm(sorted(sources), desc="collecting", unit="file")):
+    for source in (pbar := tqdm(resolved.paths, desc="collecting", unit="file")):
         pbar.set_postfix_str(source.name)
         replacement = _replacement_suffix(source, tools) if incompatible == "replace" else None
         if replacement:

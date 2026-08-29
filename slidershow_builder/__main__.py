@@ -14,7 +14,7 @@ from ._lib.env import Build, Collect, FixMtime, People, Previews, Probe
 from ._lib.exif import read_exif_cache
 from ._lib.find_file_recursive import filename_cache
 from ._lib.optional_deps import MissingOptionalDependency
-from .collect import ResolveAmbiguous, collect as _collect, parse_days
+from .collect import DateIndex, ResolveAmbiguous, collect as _collect, parse_days, resolve_people
 from .media import capture_time as _capture_time, fix_mtime as _fix_mtime, probe as _probe
 from .sync import FallbackTarget, PreviewTarget, sync_tree
 
@@ -33,8 +33,18 @@ def _argv_with_implicit_build(argv: list[str]) -> list[str]:
 
 
 def _run_build(env: Build):
-    if bool(env.file) == bool(env.dir):
-        raise SystemExit("Pass either --file (a spreadsheet) or --dir (a folder of media)")
+    people_mode = bool(env.names) or bool(env.date_ranges)
+    if sum((bool(env.file), bool(env.dir), people_mode)) != 1:
+        raise SystemExit(
+            "Pass exactly one of: --file (a spreadsheet), --dir (a folder of media), "
+            "--names/--date-ranges (resolve people straight to source paths, no `collect` step)"
+        )
+    if env.dump_sheet and not people_mode:
+        raise SystemExit("--dump-sheet only makes sense with --names/--date-ranges")
+
+    if people_mode:
+        _run_build_people(env)
+        return
 
     with read_exif_cache(env.read_exif_cache):
         if env.dir:
@@ -80,6 +90,42 @@ class _BuildShim:
 
     def __init__(self, env: Build):
         self.env = env
+
+
+def _run_build_people(env: Build):
+    """`build --names ...`/`build --date-ranges ...`: resolve people straight to source
+    paths and render (or --dump-sheet) — skips the `collect` symlink-folder step entirely."""
+    try:
+        from ._lib.process import dump_people_sheet, process_people
+    except ImportError as e:
+        raise MissingOptionalDependency("Building a slidershow", "build") from e
+
+    rows: set[_people.Row] = set()
+    if env.names:
+        rows = _people.read_index(env.index)
+        if not rows:
+            raise SystemExit(f"No people index at {env.index} — run `slidershow-builder people --takeout-dir ...` first")
+    if not env.search_dirs:
+        raise SystemExit("--search-dirs is required (one or more directories holding your originals)")
+
+    days = parse_days(env.date_ranges)
+    resolved = resolve_people(
+        rows, env.names, env.search_dirs, whole_day=env.whole_day, dates=days,
+        mode=env.people_mode, tools=env.tools, date_cache=env.date_cache, on_event=print,
+    )
+    if resolved.missing:
+        print(f"Not found ({len(resolved.missing)}): {', '.join(resolved.missing)}")
+    if not resolved.paths:
+        raise SystemExit("Nothing resolved: --names/--date-ranges matched nothing under --search-dirs")
+
+    dates = resolved.dates or DateIndex(env.tools, env.date_cache)
+    paths = sorted(resolved.paths, key=dates.taken)
+    dates.save()
+
+    if env.dump_sheet:
+        dump_people_sheet(paths, dates.day, env.dump_sheet)
+        return
+    process_people(_BuildShim(env), paths, dates.day)
 
 
 def _run_previews(env: Previews):
@@ -136,20 +182,20 @@ def _resolve_ambiguous_interactively(m: Mininterface, tools) -> ResolveAmbiguous
 
 def _run_collect(m: Mininterface):
     env: Collect = m.env
+    rows: set[_people.Row] = set()
     filenames: set[str] = set()
-    person_days: set[str] = set()
     taken_hint: dict[str, datetime] = {}
     if env.names:
         rows = _people.read_index(env.index)
         if not rows:
             raise SystemExit(f"No people index at {env.index} — run `slidershow-builder people --takeout-dir ...` first")
-        filenames, person_days = _people.files_and_days(rows, set(env.names))
+        filenames, _person_days = _people.files_and_days(rows, set(env.names))
         taken_hint = _people.taken_hints(rows, set(env.names))
         if not filenames:
             known = ", ".join(sorted(_people.counts(rows))) or "(none)"
             raise SystemExit(f"Nobody named {sorted(env.names)!r} in {env.index}. Known: {known}")
     days = parse_days(env.date_ranges)
-    if not filenames and not days:
+    if not env.names and not days:
         raise SystemExit("Nothing to collect: pass --names and/or --date-ranges")
     if not env.search_dirs:
         raise SystemExit("--search-dirs is required (one or more directories holding your originals)")
@@ -158,9 +204,10 @@ def _run_collect(m: Mininterface):
     report = _collect(
         env.dest,
         search_dirs=env.search_dirs,
-        filenames=filenames,
+        names=env.names,
+        index_rows=rows,
         days=days,
-        whole_day_of=person_days if env.whole_day else (),
+        whole_day=env.whole_day,
         taken_hint=taken_hint,
         date_tolerance=timedelta(hours=env.date_tolerance_hours),
         resolve_ambiguous=_resolve_ambiguous_interactively(m, env.tools) if env.interactive else None,

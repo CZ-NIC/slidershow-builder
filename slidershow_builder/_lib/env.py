@@ -7,9 +7,51 @@ from typing import Literal
 
 from tyro.conf import Positional
 
-from ..collect import Incompatible
+from ..collect import Incompatible, PeopleMode
 from ..media import Tools
 from ..people import DEFAULT_INDEX
+
+
+@dataclass
+class PeopleSelection:
+    """Fields shared by `collect --names` and `build --people`: resolving person names
+    (and/or bare calendar days) plus search directories into a list of source paths is the
+    exact same problem for both, so both take the same flags for it.
+    """
+
+    search_dirs: list[Path] = field(default_factory=list, kw_only=True)
+    """Directories holding your originals, searched recursively. (required)"""
+
+    names: list[str] = field(default_factory=list, kw_only=True)
+    """Person name(s) to select, as spelled in the people index."""
+
+    date_ranges: list[str] = field(default_factory=list, kw_only=True)
+    """Day or "from:to" range(s) to select regardless of who is on the photo,
+    e.g. 2026-08-05:2026-08-07. Capture time decides, mtime for files that carry none."""
+
+    whole_day: bool = field(default=False, kw_only=True)
+    """Also select everything taken on the same day as any --names match — the rest of
+    the outing, not just the shots someone happens to be tagged in."""
+
+    index: Path = field(default=DEFAULT_INDEX, kw_only=True)
+    """People index (CSV) the --names are looked up in; written by the `people` subcommand.
+    Columns `name,filename,taken`:
+      name — person's name, exactly as --names spells it (free text)
+      filename — base name of the original, no path; found under --search-dirs, case-insensitively
+      taken — ISO capture time, or empty; used by --whole-day and to break a tie when a
+              filename matches more than one file on disk (see --date-tolerance-hours)
+    One row per person *per photo*, e.g. `Jan Novák,IMG_0001.jpg,2026-08-05T10:00:00+00:00`.
+    The whole file is read (unlike the sheet, an empty line does not stop parsing) and rows are
+    sorted/deduplicated on write, so their order means nothing. Nothing here is Google-specific —
+    hand-write the file if you like; Takeout is only the one importer that exists.
+    """
+
+    date_cache: bool = field(default=True, kw_only=True)
+    """Cache capture times across runs (read whenever --whole-day/--date-ranges is used, or a
+    filename matches more than one file on disk)."""
+
+    tools: Tools = field(default_factory=Tools, kw_only=True)
+    """Configurable paths to the ffmpeg/ffprobe binaries."""
 
 
 @dataclass
@@ -137,12 +179,27 @@ class Env:
 
 
 @dataclass
-class Build(Env):
-    """Generate a slidershow HTML from a spreadsheet (.ods).
+class Build(Env, PeopleSelection):
+    """Generate a slidershow HTML from a spreadsheet (.ods), a folder, or people selection.
 
     This is the default subcommand: `slidershow-builder --file x.ods` is equivalent
     to `slidershow-builder build --file x.ods`.
+
+    A third mode, alongside --file/--dir: pass --names and/or --date-ranges (the same
+    flags `collect` takes) to resolve people straight to source paths and render them,
+    with no intermediate symlink folder:
+
+        slidershow-builder build --names "Jan Novák" --search-dirs ~/Photos --output trip.html
     """
+
+    people_mode: PeopleMode = "union"
+    """Only meaningful with several --names. union (default): photos with at least one of
+    them. intersection: only photos where all of them appear together."""
+
+    dump_sheet: Path | None = None
+    """Instead of rendering HTML, write the resolved+ordered+sectioned --people selection as
+    an .ods spreadsheet in the format --sheet documents, for hand-tuning in LibreOffice before
+    a normal `build --file`. Only valid together with --names/--date-ranges."""
 
 
 @dataclass
@@ -214,7 +271,7 @@ class Probe:
 
 
 @dataclass
-class Collect:
+class Collect(PeopleSelection):
     """Symlink originals scattered over several disks into one folder ready for slidershow.
 
     Selects them by the people tagged on them (`people` subcommand's index) and/or by the
@@ -231,20 +288,6 @@ class Collect:
     dest: Positional[Path]
     """Folder to fill with symlinks. Created if missing; re-running only adds what is new."""
 
-    search_dirs: list[Path] = field(default_factory=list)
-    """Directories holding your originals, searched recursively. (required)"""
-
-    names: list[str] = field(default_factory=list)
-    """Person name(s) to collect, as spelled in the people index."""
-
-    date_ranges: list[str] = field(default_factory=list)
-    """Day or "from:to" range(s) to collect regardless of who is on the photo,
-    e.g. 2026-08-05:2026-08-07. Capture time decides, mtime for files that carry none."""
-
-    whole_day: bool = False
-    """Also collect everything taken on the same day as any --names match — the rest of
-    the outing, not just the shots someone happens to be tagged in."""
-
     incompatible: Incompatible = "replace"
     """What to do with files no browser can display (HEIC/HEIF photos, exotic video codecs):
     * replace  — write a converted .jpg/.mp4 into DEST instead of the symlink, so the folder
@@ -259,6 +302,7 @@ class Collect:
     preview_dir: Path | None = None
     """Also generate 320px WebP thumbnails here, mirroring DEST (for `sli-thumb`)."""
 
+<<<<<<< HEAD
     index: Path = DEFAULT_INDEX
     """People index (CSV) the --names are looked up in; written by the `people` subcommand.
     Columns `name,filename,taken`:
@@ -288,18 +332,11 @@ class Collect:
     """Stamp each symlink's own mtime with the photo's capture time, so DEST sorts
     chronologically. The originals are never touched."""
 
-    date_cache: bool = True
-    """Cache capture times across runs (read whenever --whole-day/--date-ranges is used, or a
-    filename matches more than one file on disk)."""
-
     dry_run: bool = False
     """Print what would happen, create nothing."""
 
     json: bool = False
     """Print the report as JSON instead of a text summary."""
-
-    tools: Tools = field(default_factory=Tools)
-    """Configurable paths to the ffmpeg/ffprobe binaries."""
 
 
 @dataclass

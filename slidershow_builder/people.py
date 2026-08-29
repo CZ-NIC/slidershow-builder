@@ -70,6 +70,22 @@ def taken_hints(rows: Iterable[Row], names: set[str]) -> dict[str, datetime]:
     return hints
 
 
+def files_by_name(rows: Iterable[Row], names: set[str]) -> dict[str, set[str]]:
+    """File names tagged with each of `names`, kept apart — `files_and_days` collapses
+    several names into one combined set, which is exactly what an intersection query
+    (`--people-mode intersection`) cannot use."""
+    result: dict[str, set[str]] = {name: set() for name in names}
+    for name, filename, _taken in rows:
+        if name in names:
+            result[name].add(filename)
+    return result
+
+
+def days_for_files(rows: Iterable[Row], filenames: set[str]) -> set[str]:
+    """Calendar days any of `filenames` was taken on, per the index's `taken` column."""
+    return {taken[:10] for _name, filename, taken in rows if filename in filenames and taken}
+
+
 # --- Google Takeout importer ------------------------------------------------
 
 def _iter_sidecars(takeout_dir: Path) -> Iterator[tuple[str, dict]]:

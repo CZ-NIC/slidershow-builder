@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import logging
+from datetime import date
 from pathlib import Path
 from re import match
+from typing import Callable
 from jinja2 import Template
 
 from tqdm import tqdm
@@ -244,6 +246,70 @@ def process_dir(m, directory: Path):
     if group_by:
         dates.save()
     write_presentation(m, output, m.env.output, section_title=first_key)
+
+
+def day_title(day: str) -> str:
+    """`"2026-08-05"` -> a human-readable title for that day's section/title frame."""
+    return date.fromisoformat(day).strftime("%A, %B %d, %Y")
+
+
+def process_people(m, paths: list[Path], day_of: Callable[[Path], str]) -> None:
+    """Render an already-resolved, chronologically-sorted list of paths (`build --people`)
+    as a presentation, breaking into one <section> per calendar day with a title frame —
+    the counterpart of `process_sheet`'s SECTION/text-frame handling for the case there is
+    no sheet to read them from (mirrors `process_dir`'s shape otherwise).
+    """
+    if not paths:
+        raise ValueError("No media files resolved for --people")
+    output: list[str] = []
+    current_day: str | None = None
+    for path in (pbar := tqdm(paths)):
+        pbar.set_postfix_str(path.name)
+        day = day_of(path)
+        pieces = []
+        if day != current_day:
+            if current_day is not None:
+                pieces.append("</section><section>")
+            pieces.append(TEMPLATE_TEXT.format(title=day_title(day), text=""))
+            current_day = day
+        pieces.append(render_media(m, Path(m.env.convert.run(path))))
+        if m.env.output:
+            output.extend(pieces)
+        else:
+            for piece in pieces:
+                print(piece)
+    write_presentation(m, output, m.env.output)
+
+
+def dump_people_sheet(paths: list[Path], day_of: Callable[[Path], str], out: Path) -> None:
+    """Write the same resolved+sectioned --people selection `process_people` would render,
+    as an .ods spreadsheet in the `Env.sheet`-documented format instead of HTML, so it can be
+    hand-tuned in LibreOffice and then built normally with `build --file`.
+    """
+    import ezodf
+
+    rows: list[tuple[str, str, str, str]] = []
+    current_day: str | None = None
+    for path in paths:
+        day = day_of(path)
+        if day != current_day:
+            if current_day is not None:
+                rows.append(("SECTION", "", "", ""))
+            rows.append(("", "", day_title(day), ""))
+            current_day = day
+        rows.append(("", str(path), "", ""))
+
+    doc = ezodf.newdoc(doctype="ods", filename=str(out))
+    sheet = ezodf.Sheet("people", size=(len(rows) + 1, 4))
+    doc.sheets += sheet
+    for col, header in enumerate(("comment", "filename", "start", "commands")):
+        sheet[0, col].set_value(header)
+    for r, row in enumerate(rows, start=1):
+        for c, value in enumerate(row):
+            if value:
+                sheet[r, c].set_value(value)
+    doc.save()
+    print(f"Written to {out}")
 
 
 def process_sheet(m, suffix, sheet):
