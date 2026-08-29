@@ -31,6 +31,23 @@ slidershow-builder collect ./trip --search-dirs ~/Photos /mnt/backup \
     --names "Jan Novák" --whole-day --date-ranges 2026-08-05:2026-08-07
 ```
 
+* or skip straight to a presentation
+
+`build` accepts the same `--names`/`--date-ranges`/`--search-dirs`/`--whole-day` selection as
+`collect`, so a slideshow for a few friends is one command — no symlink folder, no sheet to
+write by hand. Photos land chronologically, split into a `<section>` per day with a date
+title frame.
+
+```bash
+slidershow-builder build --search-dirs ~/Photos /mnt/backup \
+    --names "Jan Novák" "Petra Malá" --whole-day --output trip.html
+```
+
+Pass `--people-mode intersection` to keep only photos where *all* the named people appear
+together (default `union`: anyone of them is enough). `--dump-sheet trip.ods` writes the
+resolved, day-sectioned list as a sheet instead of rendering HTML, so it can be hand-tuned
+(zoom points, video commands, wording) before a normal `build --file trip.ods`.
+
 # Installation
 
 ```bash
@@ -137,6 +154,7 @@ different file names.
 ```
 slidershow-builder [build] --file x.ods   # sheet -> presentation HTML (implicit default)
 slidershow-builder build --dir folder     # ... or straight from a folder of media
+slidershow-builder build --names "..."    # ... or straight from a list of people
 slidershow-builder people                 # who is on which photo (index for `collect --names`)
 slidershow-builder collect DEST           # symlink the matching originals into one folder
 slidershow-builder previews SOURCE        # thumbnails + fallback conversions for a media tree
@@ -145,13 +163,32 @@ slidershow-builder probe FILE             # debug: codec, browser compatibility,
 ```
 
 Any of them takes `--config <yaml>` instead of a long command line; put the options under
-the subcommand's name:
+the subcommand's name. `collect` and `build --names` share the same person/date-selection
+fields (`search_dirs`, `names`, `date_ranges`, `whole_day`, `index`), so one file can hold
+both — handy for a recurring event: `collect` once for a symlink folder to poke through by
+hand, `build` straight to HTML for a quick re-render once someone gets added or dropped from
+`names`:
 
 ```yaml
 collect:
+  dest: ./trip/symlinks
+  index: ./trip/people.csv
+  incompatible: link
   search_dirs: [/home/user/Photos, /mnt/backup]
-  names: ["Jan Novák"]
+  names: ["Jan Novák", "Petra Malá"]
   date_ranges: ["2026-08-05:2026-08-07"]
+
+build:
+  index: ./trip/people.csv
+  search_dirs: [/home/user/Photos, /mnt/backup]
+  names: ["Jan Novák", "Petra Malá"]
+  whole_day: true
+  output: trip.html
+```
+
+```bash
+slidershow-builder collect --config trip.yaml
+slidershow-builder build --config trip.yaml
 ```
 
 ## Browser-incompatible files
