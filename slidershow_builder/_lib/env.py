@@ -272,7 +272,7 @@ class Collect:
     hand-write the file if you like; Takeout is only the one importer that exists.
     """
 
-    date_tolerance_hours: float = 12
+    date_tolerance_hours: float = 12.0
     """A filename matching more than one file on disk (a camera's counter can repeat across
     years) is resolved by comparing each candidate's own capture time to the index's tagged
     `taken` date; this is how far apart the two may be and still count as the same photo.
