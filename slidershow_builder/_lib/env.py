@@ -302,20 +302,6 @@ class Collect(PeopleSelection):
     preview_dir: Path | None = None
     """Also generate 320px WebP thumbnails here, mirroring DEST (for `sli-thumb`)."""
 
-<<<<<<< HEAD
-    index: Path = DEFAULT_INDEX
-    """People index (CSV) the --names are looked up in; written by the `people` subcommand.
-    Columns `name,filename,taken`:
-      name — person's name, exactly as --names spells it (free text)
-      filename — base name of the original, no path; `collect` finds it under --search-dirs, case-insensitively
-      taken — ISO capture time, or empty; used by --whole-day and to break a tie when a
-              filename matches more than one file on disk (see --date-tolerance-hours)
-    One row per person *per photo*, e.g. `Jan Novák,IMG_0001.jpg,2026-08-05T10:00:00+00:00`.
-    The whole file is read (unlike the sheet, an empty line does not stop parsing) and rows are
-    sorted/deduplicated on write, so their order means nothing. Nothing here is Google-specific —
-    hand-write the file if you like; Takeout is only the one importer that exists.
-    """
-
     date_tolerance_hours: float = 12.0
     """A filename matching more than one file on disk (a camera's counter can repeat across
     years) is resolved by comparing each candidate's own capture time to the index's tagged
