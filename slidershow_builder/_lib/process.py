@@ -9,7 +9,7 @@ from tqdm import tqdm
 from .exif import read_exif
 
 from ..collect import DateIndex
-from ..media import DEFAULT_TOOLS, kind_of
+from ..media import DEFAULT_TOOLS, capture_time, kind_of
 from .find_file_recursive import find_file_recursive
 from .convert import IMAGE_SUFFIXES
 
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Attribute names are slidershow's own `sli-<property>`, the only spelling `prop()` resolves
 # (verified against the released bundle); the `data-` names of old are not read at all.
 TEMPLATE_VIDEO = Template(
-    """<article{% if points %} sli-video-points='[{{ points }}]'{% endif %}><video controls="controls" sli-src="{{ src }}"></video></article>"""
+    """<article{% if points %} sli-video-points='[{{ points }}]'{% endif %}><video controls="controls" sli-src="{{ src }}" {% if datetime %} sli-datetime="{{ datetime }}"{% endif %}></video></article>"""
 )
 TEMPLATE_IMG = Template(
     """<article{% if points %} sli-step-points='{{ points }}'{% endif %}><img sli-src="{{ src }}" {% if datetime %} sli-datetime="{{ datetime }}"{% endif %}{% if device %} sli-device="{{ device }}"{% endif %}{% if gps %} sli-gps="{{ gps[0] }}, {{ gps[1] }}"{% endif %}/></article>"""
@@ -182,8 +182,12 @@ def render_media(m, path: Path, points: str = "") -> str:
     """One media frame. `src` stays exactly the path we were given (relative paths in the
     sheet/directory are what the HTML has to keep, they are resolved by the browser)."""
     if kind_of(path) == "video":
-        return TEMPLATE_VIDEO.render(points=points, src=path)
+        dt = capture_time(path, tools=DEFAULT_TOOLS) if m.env.read_exif else None
+        return TEMPLATE_VIDEO.render(points=points, src=path, datetime=dt.isoformat() if dt else None)
     device, gps, dt = read_exif(path) if m.env.read_exif else (None, None, None)
+    if m.env.read_exif and not dt:
+        # piexif reads JPEG/TIFF only; HEIC (and any exif-less JPEG) falls back to Pillow.
+        dt = capture_time(path, tools=DEFAULT_TOOLS)
     return TEMPLATE_IMG.render(points=points, src=path,
                                datetime=dt.isoformat() if dt else None, device=device, gps=gps)
 
@@ -275,6 +279,8 @@ def process_sheet(m, suffix, sheet):
                         )
             else:
                 template = TEMPLATE_VIDEO
+                if m.env.read_exif:
+                    dt = capture_time(path, tools=DEFAULT_TOOLS)
                 try:
                     points = ",".join(parse_commands(start, commands))
                 except ValueError as e:
